@@ -1,6 +1,6 @@
 # XAU Companion
 
-Requires Node.js 18+ and a running XAU API.
+A companion for [Xbox Achievement Unlocker](https://github.com/Fumo-Unlockers/Xbox-Achievement-Unlocker). Requires Node.js 18+ and a running XAU API.
 
 Run `Start XAU Companion.bat` (Windows) or `Start XAU Companion.command` (macOS), or start manually:
 
@@ -8,7 +8,7 @@ Run `Start XAU Companion.bat` (Windows) or `Start XAU Companion.command` (macOS)
 npm start
 ```
 
-Open http://127.0.0.1:3000. Set `XAU_URL` to change the default XAU address (`http://localhost:1337`).
+Open http://127.0.0.1:3000. Set `XAU_URL` to change the default XAU address (`http://192.168.1.119:1337`).
 
 Choose a game, load an Xbox timeline by gamertag or import it manually, select achievements, and start copying. Copying requires a confirmed Title Based game from the online Fumo Unlockers catalog. Pausing preserves the remaining delay; progress and the XAU account are stored in `state.json`. The queue pauses if the account changes. The server stops shortly after the last page closes; reopen the app to resume the queue. Only individual unlock requests are used, at least 60 seconds apart.
 

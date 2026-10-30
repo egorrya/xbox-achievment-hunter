@@ -29,7 +29,7 @@ test('queue persists, pauses and resumes without unlockall', async () => {
     const paused=await post('/api/pause');assert.equal(paused.status,'paused');assert.equal(paused.index,1);assert.ok(paused.remaining>115000);
     const persisted=JSON.parse(await readFile(stateFile,'utf8'));assert.equal(persisted.index,1);assert.deepEqual(persisted.entries.map(a=>a.id),['1','3']);
     await sleep(100); account='8888'; const resumed=await post('/api/resume');assert.equal(resumed.status,'running');assert.ok(resumed.dueAt-Date.now()>115000);
-    for(let i=0;i<50;i++){const state=await (await fetch(base+'/api/state')).json();if(state.status==='paused'){assert.match(state.error,/Аккаунт XAU изменился/);break;}await sleep(50);if(i===49)assert.fail('account change did not pause the queue');}
+    for(let i=0;i<50;i++){const state=await (await fetch(base+'/api/state')).json();if(state.status==='paused'){assert.match(state.error,/The XAU account changed/);break;}await sleep(50);if(i===49)assert.fail('account change did not pause the queue');}
     assert.equal(calls.filter(x=>x==='/api/achievements/unlock').length,1);assert.ok(calls.includes('/api/spoof/123'));assert.ok(!calls.some(x=>x.includes('unlockall')));
   } finally {child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });
@@ -61,10 +61,10 @@ test('request errors pause and persist the queue without retrying', async () => 
     let state = await paused(); assert.match(state.error,/spoof failed/); assert.equal(state.index,0); assert.equal(calls.filter(x=>x.includes('/unlock')).length,0);
     assert.equal(JSON.parse(await readFile(stateFile,'utf8')).status,'paused');
     const before = calls.length; await sleep(1200); assert.equal(calls.length,before);
-    mode='unlock-error'; await request('/api/resume'); state=await paused(); assert.match(state.error,/unlock failed/); assert.match(state.error,/неизвестен/); assert.equal(state.index,0);
+    mode='unlock-error'; await request('/api/resume'); state=await paused(); assert.match(state.error,/unlock failed/); assert.match(state.error,/unknown/); assert.equal(state.index,0);
     const denied=await fetch(base+'/api/resume',{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:'{}'});assert.equal(denied.status,400);
     const check=await (await fetch(base+'/api/uncertain')).json();assert.equal(check.progress,'notstarted');
-    const skipped=await request('/api/resolve',{id:'1',choice:'skip'});assert.equal(skipped.status,'completed');assert.equal(skipped.results['1'],'skipped');assert.ok(skipped.log.some(x=>x.message.includes('Пропущено пользователем')));
+    const skipped=await request('/api/resolve',{id:'1',choice:'skip'});assert.equal(skipped.status,'completed');assert.equal(skipped.results['1'],'skipped');assert.ok(skipped.log.some(x=>x.message.includes('Skipped by user')));
     await request('/api/reset'); mode='owned'; const unlockCount=calls.filter(x=>x==='/api/achievements/unlock').length;
     await request('/api/start', {titleId:'123', entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z'}]});
     for(let i=0;i<60;i++){state=await (await fetch(base+'/api/state')).json();if(state.status==='completed')break;await sleep(50)}
@@ -105,7 +105,7 @@ test('restart after an interrupted unlock pauses without a stale remaining delay
   const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:String(port),STATE_FILE:file},stdio:'ignore'});
   try {
     let state;for(let i=0;i<40;i++){try{state=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();break}catch{await sleep(50)}}
-    assert.equal(state.status,'paused');assert.equal(state.index,0);assert.equal(state.remaining,0);assert.equal(state.uncertainId,'1');assert.match(state.error,/неизвестен/);
+    assert.equal(state.status,'paused');assert.equal(state.index,0);assert.equal(state.remaining,0);assert.equal(state.uncertainId,'1');assert.match(state.error,/unknown/);
     assert.equal(JSON.parse(await readFile(file,'utf8')).status,'paused');
   } finally {child.kill();await new Promise(r=>child.once('exit',r));await rm(dir,{recursive:true,force:true});}
 });
@@ -129,7 +129,7 @@ test('unlock requests are spaced and the journal records them', async () => {
     const entries=['1','2'].map(id=>({id,name:id,time:'2025-01-01T00:00:00Z'}));
     const started=await fetch(base+'/api/start',{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({titleId:'123',entries})});assert.equal(started.status,200);
     let state;for(let i=0;i<80;i++){state=await (await fetch(base+'/api/state')).json();if(state.index===1)break;await sleep(50)}
-    assert.equal(state.index,1);assert.equal(sent.length,1);assert.ok(state.dueAt-sent[0]>=59000);assert.ok(state.log.some(x=>x.message.includes('Спуф')));assert.equal(state.log.filter(x=>x.message.startsWith('Отправлено:')).length,1);
+    assert.equal(state.index,1);assert.equal(sent.length,1);assert.ok(state.dueAt-sent[0]>=59000);assert.ok(state.log.some(x=>x.message.includes('Spoof')));assert.equal(state.log.filter(x=>x.message.startsWith('Sent:')).length,1);
     await sleep(1200);assert.equal(sent.length,1);
   }finally{child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });

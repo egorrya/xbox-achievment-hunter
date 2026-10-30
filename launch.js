@@ -11,8 +11,8 @@ createInterface({ input: child.stdout }).on('line', line => {
   const url = match[1];
   const command = process.platform === 'win32' ? 'rundll32' : process.platform === 'darwin' ? 'open' : 'xdg-open';
   const args = process.platform === 'win32' ? ['url.dll,FileProtocolHandler', url] : [url];
-  execFile(command, args, error => { if (error) console.error(`Не удалось открыть браузер. Откройте ${url} вручную.`); });
+  execFile(command, args, error => { if (error) console.error(`Could not open the browser. Open ${url} manually.`); });
 });
-child.on('error', error => { console.error('Не удалось запустить сервер:', error.message); process.exitCode = 1; });
+child.on('error', error => { console.error('Could not start the server:', error.message); process.exitCode = 1; });
 child.on('exit', (code, signal) => { if (!signal && code) process.exitCode = code; });
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { if (!child.killed) child.kill(signal); });
