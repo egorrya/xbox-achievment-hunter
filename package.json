@@ -1,13 +1,14 @@
 {
-	"name": "xau-companion",
-	"version": "1.0.0",
-	"private": true,
-	"type": "module",
-	"scripts": {
-		"start": "node server.js",
-		"test": "node --test"
-	},
-	"engines": {
-		"node": ">=18"
-	}
+  "name": "xau-companion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "dev": "node dev.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
