@@ -3,3 +3,7 @@ state.json.tmp
 node_modules/
 
 .auth/
+dist/
+
+state.json.spoof*
+state.json.settings*

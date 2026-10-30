@@ -1,19 +1,11 @@
 import http from 'node:http';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
-import { watch } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import { MIN_INTERVAL_MS } from './public/timing.js';
-import { xboxApi, loginStatus, useXauth, signOut, restoreXauth } from './xbox-client.js';
+import { xboxApi, loginStatus, signOut, attachXboxPc, currentSessionXuid } from './xbox-client.js';
+import { ensureXboxPc } from './windows-auth.js';
+import { createStatsService } from './stats.js';
 
-const DEV_MODE = process.env.DEV_MODE === '1';
-let devVersion = DEV_MODE ? randomUUID() : null, devTimer;
-let devWatcher;
-if (DEV_MODE) devWatcher = watch('public', (_event, filename) => {
-  if (filename && !/\.(?:js|css|html)$/.test(String(filename))) return;
-  clearTimeout(devTimer);
-  devTimer = setTimeout(() => { devVersion = randomUUID(); console.log('Frontend changed. Reloading pages…'); }, 5000);
-});
 const PORT = Number(process.env.PORT || 3000);
 const XAU = process.env.XAU_URL?.replace(/\/$/, '');
 const CATALOG_URL = process.env.TITLE_CATALOG_URL || 'https://raw.githubusercontent.com/Fumo-Unlockers/XboxGames/main/xbox_games.json';
@@ -22,7 +14,35 @@ const STATE_FILE = process.env.STATE_FILE || join(process.cwd(), 'state.json');
 let state = { status: 'idle' }, busy = false, mutating = false;
 try { state = JSON.parse(await readFile(STATE_FILE, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
 if (state.inFlight) { state.uncertainId = state.inFlight; state.status = 'paused'; state.remaining = Math.max(0, (state.dueAt || Date.now()) - Date.now()); state.error = 'The result of the previous request is unknown. Check the achievement before continuing.'; state.log = [...(state.log || []), {time: new Date().toISOString(), message: 'Queue stopped: ' + state.error}].slice(-200); delete state.inFlight; }
+const SPOOF_FILE = STATE_FILE + '.spoof';
 let spoof = { status: 'idle' };
+try {
+  const saved = JSON.parse(await readFile(SPOOF_FILE, 'utf8'));
+  if (saved && typeof saved === 'object') {
+    spoof = saved.status === 'running' ? { ...saved, status:'idle', endedAt:saved.lastUpdatedAt || saved.startedAt, notice:'Previous session was interrupted when the app closed. Start it again.' } : saved;
+  }
+} catch (e) { if (e.code !== 'ENOENT') throw e; }
+async function saveSpoof() {
+  const { accountXuid, ...safe } = spoof;
+  const tmp = SPOOF_FILE + '.tmp';
+  await writeFile(tmp, JSON.stringify(safe));
+  await rename(tmp, SPOOF_FILE);
+}
+
+const SETTINGS_FILE = STATE_FILE + '.settings';
+let settings = {};
+try { const saved = JSON.parse(await readFile(SETTINGS_FILE, 'utf8')); if (saved && typeof saved === 'object' && !Array.isArray(saved)) settings = saved; }
+catch (e) { if (e.code !== 'ENOENT') throw e; }
+let settingsWrites = Promise.resolve();
+async function saveSetting(key, value) {
+  const operation = settingsWrites.then(async () => {
+    const next = { ...settings, [key]:value }, encoded = JSON.stringify(next);
+    if (Buffer.byteLength(encoded) > 4_000_000) throw new Error('Saved settings are too large');
+    const tmp = SETTINGS_FILE + '.tmp'; await writeFile(tmp, encoded); await rename(tmp, SETTINGS_FILE); settings = next;
+  });
+  settingsWrites = operation.catch(() => {});
+  return operation;
+}
 async function save() { const tmp = STATE_FILE + '.tmp'; await writeFile(tmp, JSON.stringify(state, null, 2)); await rename(tmp, STATE_FILE); }
 await save();
 function log(message) {
@@ -59,6 +79,7 @@ async function get(url, options = {}) {
   return data;
 }
 const xau = (path, options) => XAU ? get(XAU + path, options) : xboxApi(path, options);
+const statsService = createStatsService({ xau });
 const responseCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 function clearResponseCache() { responseCache.clear(); }
@@ -163,20 +184,37 @@ async function referenceHistory(tag, title) {
   return { entries, minutesPlayed };
 
 }
-if (!XAU) restoreXauth();
+
+let autoAuth = { status:'idle' }, autoAuthEnabled = process.platform === 'win32' && process.env.XAU_DESKTOP === '1' && !XAU, nextAutoCheck = 0;
+async function autoConnect() {
+  if (!autoAuthEnabled || Date.now() < nextAutoCheck || busy || mutating || spoof.status === 'running' || (state.status === 'running' && state.dueAt - Date.now() < 180000)) return;
+  const existing = loginStatus();
+  if (existing.status === 'signed_in' && existing.source !== 'xbox-pc') return;
+  mutating=true; autoAuth={status:'connecting'};
+  try {
+    await ensureXboxPc();
+    if (existing.status !== 'signed_in') await new Promise(resolve=>setTimeout(resolve,5000));
+    await attachXboxPc({expectedXuid:currentSessionXuid()});
+    clearResponseCache(); autoAuth={status:'connected'}; nextAutoCheck=Date.now()+300000;
+  } catch(e) { autoAuth={status:'waiting',error:e.message || 'Could not connect to Xbox PC'}; nextAutoCheck=Date.now()+30000; }
+  finally { mutating=false; }
+}
+const autoAuthTimer=autoAuthEnabled ? setInterval(autoConnect,5000) : null; if(autoAuthEnabled) void autoConnect();
 async function tick() {
   if (!XAU && loginStatus().status==='restoring') return;
   if (busy || mutating) return;
   busy = true;
   try {
+    if (spoof.status === 'running' && Date.now() - (spoof.lastUpdatedAt || spoof.startedAt) >= 10000) { spoof.lastUpdatedAt = Date.now(); await saveSpoof(); }
     if (spoof.status === 'running' && Date.now() >= spoof.nextHeartbeat) {
       try {
+        if (!XAU && loginStatus().source==='xbox-pc') { if (autoAuthEnabled) await ensureXboxPc(); await attachXboxPc({expectedXuid:spoof.accountXuid}); }
         if (await currentXuid() !== spoof.accountXuid) throw new Error('The Xbox account changed');
         const now = Date.now();
         const result = await xau('/api/spoof/' + id(spoof.titleId));
         if (result?.message !== 'Spoofing started successfully.' || String(result.titleId) !== spoof.titleId) throw new Error('Invalid spoof response');
         spoof.nextHeartbeat = now + 290000;
-      } catch (e) { spoof = { status:'error', titleId:spoof.titleId, error:e.message || 'Presence update failed' }; }
+      } catch (e) { spoof = { ...spoof, status:'error', endedAt:Date.now(), error:e.message || 'Presence update failed' }; delete spoof.accountXuid; await saveSpoof(); }
     }
     if (state.status !== 'running') return;
     await requireTitleBased(state.titleId);
@@ -212,7 +250,7 @@ const clientTimer = setInterval(() => {
   if (!hadClient || clients.size || shuttingDown) return;
   if (closeDeadline === null) closeDeadline = now + CLOSE_GRACE_MS;
   if (now < closeDeadline || busy || mutating) return;
-  shuttingDown = true; clearTimeout(devTimer); devWatcher?.close(); clearInterval(tickTimer); clearInterval(clientTimer);
+  shuttingDown = true; clearInterval(tickTimer); clearInterval(clientTimer); if(autoAuthTimer) clearInterval(autoAuthTimer);
   console.log('All pages are closed; stopping the server.');
   server.close();
 }, 1000);
@@ -229,11 +267,15 @@ const server = http.createServer(async (req, res) => {
       else if (clients.delete(b.id) && !clients.size) closeDeadline = Date.now() + CLOSE_GRACE_MS;
       return json(res, 200, { ok: true });
     }
-    if (req.method === 'GET' && url.pathname === '/api/auth/status') return json(res, 200, XAU ? {status:'external'} : loginStatus());
-    if (req.method === 'POST' && url.pathname === '/api/auth/token') { if (XAU) throw new Error('Token sign-in is unavailable with an external XAU server'); if (spoof.status === 'running' || state.status === 'running' || busy || mutating) throw new Error('Stop spoofing, pause the queue and wait for the current request before changing accounts'); mutating=true; try {const b=await body(req); await useXauth(b.token); clearResponseCache(); return json(res, 200, loginStatus());} finally {mutating=false;} }
-    if (req.method === 'POST' && url.pathname === '/api/auth/logout') { if (XAU) throw new Error('Sign out is unavailable with an external XAU server'); if (spoof.status === 'running' || state.status === 'running' || busy || mutating) throw new Error('Stop spoofing, pause the queue and wait for the current request before signing out'); mutating=true; try {await signOut(); clearResponseCache(); return json(res, 200, loginStatus());} finally {mutating=false;} }
-    if (DEV_MODE && req.method === 'GET' && url.pathname === '/api/dev/version') return json(res, 200, {version:devVersion});
-    if (DEV_MODE && req.method === 'GET' && url.pathname === '/dev-reload.js') {res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-store'});return res.end(await readFile(join('public','dev-reload.js')));}
+    if (req.method === 'GET' && url.pathname === '/api/settings') return json(res,200,settings);
+    if (req.method === 'POST' && url.pathname === '/api/settings') {
+      const b = await body(req);
+      if (typeof b.key !== 'string' || !/^(?:xau-game-filters|xau-(?:profile-stats|profile-totals|selection):\d+)$/.test(b.key) || typeof b.value !== 'string' || b.value.length > 1_000_000) throw new Error('Invalid setting');
+      await saveSetting(b.key,b.value); return json(res,200,{ok:true});
+    }
+    if (req.method === 'GET' && url.pathname === '/api/auth/status') return json(res, 200, XAU ? {status:'external'} : {...loginStatus(), autoAuth});
+    if (req.method === 'POST' && url.pathname === '/api/auth/attach') { if (XAU) throw new Error('Xbox PC connection is unavailable with an external XAU server'); if (spoof.status === 'running' || state.status === 'running' || busy || mutating) throw new Error('Stop spoofing and pause the queue before changing accounts'); mutating=true; autoAuthEnabled=process.platform==='win32' && process.env.XAU_DESKTOP==='1'; autoAuth={status:'connecting'}; try { await attachXboxPc(); autoAuth={status:'connected'}; nextAutoCheck=Date.now()+300000; clearResponseCache(); return json(res,200,loginStatus()); } catch(e) {autoAuth={status:'waiting',error:e.message || 'Could not connect to Xbox PC'}; nextAutoCheck=Date.now()+30000; throw e;} finally {mutating=false;} }
+    if (req.method === 'POST' && url.pathname === '/api/auth/logout') { if (XAU) throw new Error('Sign out is unavailable with an external XAU server'); if (spoof.status === 'running' || state.status === 'running' || busy || mutating) throw new Error('Stop spoofing, pause the queue and wait for the current request before signing out'); mutating=true; autoAuthEnabled=false; autoAuth={status:'idle'}; try {await signOut(); clearResponseCache(); return json(res, 200, loginStatus());} finally {mutating=false;} }
     if (req.method === 'POST' && url.pathname === '/api/cache/refresh') { clearResponseCache(); return json(res, 200, { ok: true }); }
     if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, state);
     if (req.method === 'GET' && url.pathname === '/api/spoofer') { const {accountXuid, ...view} = spoof; return json(res, 200, view); }
@@ -243,19 +285,48 @@ const server = http.createServer(async (req, res) => {
       try {
         if (url.pathname.endsWith('/start')) {
           if (spoof.status === 'running') throw new Error('Stop the current spoof first');
-          const b=await body(req), titleId=id(b.titleId), accountXuid=await currentXuid(), startedAt=Date.now();
+          const b=await body(req), titleId=id(b.titleId);
+          if (!XAU && loginStatus().source==='xbox-pc') await attachXboxPc({expectedXuid:currentSessionXuid()});
+          const accountXuid=await currentXuid();
           const result=await xau('/api/spoof/'+titleId);
           if(result?.message !== 'Spoofing started successfully.' || String(result.titleId)!==titleId) throw new Error('Invalid spoof response');
-          spoof={status:'running',titleId,accountXuid,startedAt,nextHeartbeat:startedAt+290000};
+          const startedAt=Date.now();
+          spoof={status:'running',titleId,accountXuid,startedAt,lastUpdatedAt:startedAt,nextHeartbeat:startedAt+290000};
+          await saveSpoof();
         } else {
           if (spoof.status === 'running' && !XAU) {
             if (await currentXuid() !== spoof.accountXuid) throw new Error('The Xbox account changed');
             await xboxApi('/api/spoof-stop');
           }
-          spoof={status:'idle',...(XAU ? {notice:'Presence may remain until it expires.'} : {})};
+          spoof={...spoof,status:'idle',endedAt:Date.now(),...(XAU ? {notice:'Presence may remain until it expires.'} : {notice:'Stopped.'})};
+          delete spoof.accountXuid; await saveSpoof();
         }
         const {accountXuid, ...view}=spoof; return json(res,200,view);
       } finally { mutating=false; }
+    }
+    if (req.method === 'GET' && url.pathname === '/api/stats') {
+      return json(res,200,{stats:await statsService.read(id(url.searchParams.get('title')))});
+    }
+    if (req.method === 'POST' && url.pathname === '/api/stats') {
+      if (busy || mutating) throw new Error('Wait for the current request to finish and try again');
+      mutating=true;
+      try {const b=await body(req);return json(res,200,await statsService.write({title:id(b.title),name:b.name,scid:b.scid,value:b.value}));}
+      finally {mutating=false;}
+    }
+    if (req.method === 'GET' && url.pathname === '/api/playtime') {
+      const title = id(url.searchParams.get('title')), xuid = await currentXuid();
+      const token = (await xau('/api/xauth?format=json'))?.token;
+      if (typeof token !== 'string' || !token.trim()) throw new Error('Xbox authorization is unavailable');
+      const stats = await get(new URL('/batch', process.env.XBOX_USERSTATS_ORIGIN || 'https://userstats.xboxlive.com'), {
+        method:'POST', headers:{Authorization:token, 'x-xbl-contract-version':'2', Accept:'application/json', 'Content-Type':'application/json'},
+        body:JSON.stringify({ArrangeByField:'xuid', Xuids:[xuid], Stats:[{Name:'MinutesPlayed',TitleId:title}]})
+      });
+      let minutesPlayed = null;
+      for (const list of stats?.statListsCollection ?? stats?.StatListsCollection ?? []) for (const stat of list.stats ?? list.Stats ?? []) {
+        const name=stat.name ?? stat.Name, raw=stat.value ?? stat.Value, value=Number(raw);
+        if (typeof name === 'string' && name.toLowerCase() === 'minutesplayed' && raw !== null && raw !== undefined && raw !== '' && Number.isFinite(value) && value >= 0) minutesPlayed=value;
+      }
+      return json(res,200,{minutesPlayed,updatedAt:Date.now()});
     }
     if (req.method === 'GET' && url.pathname === '/api/profile') return json(res, 200, await cachedXau('/api/profile/me'));
     if (req.method === 'GET' && url.pathname === '/api/game') return json(res, 200, await cachedXau('/api/games/search/titleid/' + id(url.searchParams.get('title'))));
@@ -308,14 +379,14 @@ const server = http.createServer(async (req, res) => {
       state.entries=[...processed,...remaining];state.remaining=Math.max(0,remaining[0].delayMs-elapsed);state.tag=String(b.tag||'');
       delete state.error;log('Queue schedule updated');await save();return json(res,200,state);
     }
-    if (req.method === 'POST' && url.pathname === '/api/reset') { if (busy || state.status === 'running') throw new Error('Pause copying and wait for the request to finish first'); state = { status: 'idle', lastUnlockAt: state.lastUnlockAt || 0 }; await save(); return json(res, 200, state); }
+    if (req.method === 'POST' && url.pathname === '/api/reset') { const b=await body(req); if(b.titleId!==undefined && id(b.titleId)!==state.titleId) throw new Error('The queue has changed; refresh and try again'); if (busy || state.status === 'running') throw new Error('Pause copying and wait for the request to finish first'); state = { status: 'idle', lastUnlockAt: state.lastUnlockAt || 0 }; await save(); return json(res, 200, state); }
       } finally { mutating = false; }
     }
-    const files = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/timing.js': ['timing.js','text/javascript'], '/style.css': ['style.css','text/css'] }; const file = files[url.pathname] || (/^\/games(?:\/\d+)?\/?$/.test(url.pathname) ? ['index.html','text/html'] : undefined);
-    if (req.method === 'GET' && file) { const content=await readFile(join('public', file[0])); res.writeHead(200, { 'Content-Type': file[1] + '; charset=utf-8', 'Cache-Control':'no-store' }); return res.end(DEV_MODE && file[0]==='index.html' ? content.toString('utf8').replace('</body>','<script src="/dev-reload.js"></script></body>') : content); }
+    const files = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/timing.js': ['timing.js','text/javascript'], '/style.css': ['style.css','text/css'], '/spoof-panel.js': ['spoof-panel.js','text/javascript'], '/stats-panel.js': ['stats-panel.js','text/javascript'] }; const file = files[url.pathname] || (/^\/games(?:\/\d+)?\/?$/.test(url.pathname) ? ['index.html','text/html'] : undefined);
+    if (req.method === 'GET' && file) { const content=await readFile(join('public', file[0])); res.writeHead(200, { 'Content-Type': file[1] + '; charset=utf-8', 'Cache-Control':'no-store' }); return res.end(content); }
     json(res, 404, { error: 'Not found' });
   } catch (e) { json(res, e.status === 429 ? 429 : 400, { error: e.message || 'Request failed', ...(e.status === 429 ? {retryAfter:e.retryAfter} : {}) }); }
 });
 server.requestTimeout = 25000;
 server.headersTimeout = 26000;
-server.listen(PORT, '127.0.0.1', () => console.log(`XAU Companion: http://127.0.0.1:${PORT} (backend: ${XAU || 'Xbox API'})`));
+server.listen(PORT, '127.0.0.1', () => console.log(`XAU Companion: http://127.0.0.1:${server.address().port} (backend: ${XAU || 'Xbox API'})`));

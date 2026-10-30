@@ -1,9 +1,11 @@
 import { mkdir, readFile, writeFile, rename, chmod, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { readXboxPcCandidates } from './windows-auth.js';
 
 const authFile=process.env.AUTH_FILE || join(process.cwd(),'.auth','xauth.json');
 let session, manualPending = false, restoring = false, restoreError;
-export function loginStatus(){return {status:restoring?'restoring':session?'signed_in':'signed_out',...(restoreError?{error:restoreError}:{})};}
+export function loginStatus(){return {status:restoring?'restoring':session?'signed_in':'signed_out',pcSupported:process.platform==='win32',...(session?.source==='xbox-pc'?{source:'xbox-pc'}:{}),...(restoreError?{error:restoreError}:{})};}
+export function currentSessionXuid(){return session?.userXUID;}
 export async function signOut(){
   try {await unlink(authFile)} catch(e) {if(e.code!=='ENOENT')throw new Error('Could not remove the saved token');}
   session=undefined;restoreError=undefined;
@@ -39,11 +41,12 @@ async function request(host,path,version,{method='GET',body,successStatus,userAg
     const operation = host==='peoplehub.xboxlive.com' ? 'profile lookup' :
       host==='profile.xboxlive.com' ? 'gamertag/account lookup' :
       host==='titlehub.xboxlive.com' ? (method==='POST' ? 'game lookup' : 'games list') :
-      host==='presence-heartbeat.xboxlive.com' ? 'game presence' :
+      ['presence-heartbeat.xboxlive.com','userpresence.xboxlive.com'].includes(host) ? 'game presence' :
       host==='achievements.xboxlive.com' ? (method==='POST' ? 'achievement unlock' : 'achievement list') : 'request';
     let code;try{const data=JSON.parse(raw);const value=data?.errorCode??data?.code??data?.XErr;if(typeof value==='number'||(typeof value==='string'&&/^[a-zA-Z0-9_.-]{1,80}$/.test(value)))code=String(value)}catch{}
-    const hint=host==='presence-heartbeat.xboxlive.com' && res.status===403 ? '. Xbox rejected the presence request. Fumo OAuth Login tokens may not have presence permissions; try an XAuth token obtained from the Xbox app with OAuth Login disabled in Fumo.' : '';
+    const hint=host==='presence-heartbeat.xboxlive.com' && res.status===403 ? '. Xbox rejected the presence request. Connect the signed-in Xbox PC app and try again.' : '';
     const error = new Error(`Xbox ${operation} failed (HTTP ${res.status}${code ? `, code ${code}` : ''})${hint}`);
+    error.status=res.status;error.xboxCode=code;
     if(res.status===429){error.status=429;const value=res.headers.get('retry-after');const seconds=Number(value);const date=Date.parse(value);error.retryAfter=value && Number.isFinite(seconds) ? Math.max(0,seconds) : Number.isFinite(date) ? Math.max(0,Math.ceil((date-Date.now())/1000)) : 30;}
     throw error;
   }
@@ -77,7 +80,8 @@ return async function xboxApi(path,options={}){
   }
   if(path.startsWith('/api/spoof/')){
     const title=validId(path.split('/').at(-1));
-    await request('presence-heartbeat.xboxlive.com',`/users/xuid(${own})/devices/current/`,3,{method:'POST',body:{titles:[{id:title,expiration:600,state:'active',sandbox:'RETAIL'}]}});
+    if(!Number.isSafeInteger(Number(title)) || Number(title)<1 || Number(title)>4294967295)throw new Error('Invalid Title ID');
+    await request('presence-heartbeat.xboxlive.com',`/users/xuid(${own})/devices/current/`,3,{method:'POST',body:{titles:[{expiration:600,id:title,state:'active',sandbox:'RETAIL'}]}});
     return {message:'Spoofing started successfully.',titleId:title};
   }
   if(path==='/api/spoof-stop'){
@@ -106,12 +110,12 @@ return async function xboxApi(path,options={}){
 }
 export const xboxApi = createXboxApi();
 
-export async function useXauth(value,{fetcher=fetch,persist=true}={}){
+export async function useXauth(value,{fetcher=fetch,persist=true,expectedXuid,source='manual'}={}){
   if (manualPending) throw new Error('Token verification is already in progress');
   if (typeof value !== 'string' || value.length > 16384) throw new Error('Invalid XAuth token format');
   const match=value.trim().match(/^XBL3\.0 x=([^\s;]{1,128});([^\s;]{20,})$/);
   if (!match) throw new Error('Invalid XAuth token format');
-  const candidate={userHash:match[1],XSTSToken:match[2],manual:true};
+  const candidate={userHash:match[1],XSTSToken:match[2],source};
   manualPending=true;
   try {
     // Validate the token and resolve the account before replacing the current session.
@@ -119,7 +123,18 @@ export async function useXauth(value,{fetcher=fetch,persist=true}={}){
     const profile=await api('/api/profile/me');
     const xuid=profile?.People?.[0]?.Xuid ?? profile?.people?.[0]?.xuid;
     if(typeof xuid!=='string'||!/^\d+$/.test(xuid))throw new Error('Xbox did not return the signed-in profile');
+    if(expectedXuid && xuid!==expectedXuid)throw new Error('The Xbox PC account does not match the active account');
     if(persist)await saveToken(value.trim());
+    else if(source==='xbox-pc') { try { await unlink(authFile); } catch(e) { if(e.code!=='ENOENT')throw new Error('Could not remove the previous saved token'); } }
     candidate.userXUID=xuid; session=candidate;restoreError=undefined;
   } finally {manualPending=false;}
+}
+
+export async function attachXboxPc({expectedXuid,readCandidates=readXboxPcCandidates,fetcher=fetch}={}) {
+  const candidates=await readCandidates();
+  for(const value of candidates){
+    try { await useXauth(value,{fetcher,persist:false,expectedXuid,source:'xbox-pc'}); return loginStatus(); }
+    catch { /* A stale or unrelated credential must not prevent checking the next one. */ }
+  }
+  throw new Error('No usable Xbox PC authorization found for this account. Sign in to the Xbox app and try again.');
 }

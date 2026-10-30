@@ -1,3 +1,5 @@
+import { initSpoofPanel } from './spoof-panel.js';
+import { initStatsPanel } from './stats-panel.js';
 import { planSelected, MIN_INTERVAL_MS } from './timing.js';
 const $ = s => document.querySelector(s);
 let games = [], selected, achievements = [], entries = [], job = { status: 'idle' };
@@ -9,6 +11,20 @@ const attr = esc;
 const field = (obj, ...names) => names.map(n => obj?.[n]).find(v => v !== undefined && v !== null);
 const error = e => { $('#alert').hidden = false; $('#alert').textContent = e.message || String(e); };
 async function api(path, options = {}) { try { const r = await fetch(path, { ...options, signal: options.signal || AbortSignal.timeout(25000) }); const data = await r.json(); if (!r.ok) {const failure=new Error(data.error || 'Request failed');failure.status=r.status;failure.retryAfter=data.retryAfter;throw failure;} return data; } catch(e) { if (e.name === 'TimeoutError') throw new Error('The request timed out. Please try again.'); throw e; } }
+function loading(el, active){el.classList.toggle('is-loading',active);if(active)el.setAttribute('aria-busy','true');else el.removeAttribute('aria-busy');}
+// The desktop server changes port on each launch, so browser localStorage cannot persist these settings.
+let storedSettings = {};
+try { storedSettings = await api('/api/settings'); } catch (e) { error(new Error('Could not load saved settings.')); }
+let settingsQueue = Promise.resolve();
+const persistentStorage = {
+  getItem(key) { return storedSettings[key] ?? null; },
+  setItem(key, value) {
+    storedSettings[key] = value;
+    settingsQueue = settingsQueue.catch(() => {}).then(() => fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({key,value}), keepalive:true}))
+      .then(response => { if (!response.ok) throw new Error('Could not save settings.'); })
+      .catch(() => error(new Error('Could not save settings.')));
+  },
+};
 const post = path => api(path, {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
 function page(name) { for (const el of document.querySelectorAll('.page')) el.hidden = el.id !== name; document.querySelectorAll('.main-nav a').forEach(link => { const active=link.dataset.page === name || (name === 'game' && link.dataset.page === 'games'); link.classList.toggle('active',active); if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current'); }); $('#alert').hidden = true; window.scrollTo(0,0); }
 function navigate(path) { if (location.pathname !== path) history.pushState(null, '', path); showRoute(); }
@@ -22,7 +38,7 @@ async function showRoute() {
   if (request !== routeRequest) return;
   let game = games.find(g => String(field(g,'TitleId','titleId')) === match[1]);
   if (!game) {
-    page('games'); $('#gameCount').textContent='Looking up Title ID…';
+    page('games'); $('#gameCount').textContent='Looking up Title ID…';loading($('#gameCount'),true);
     try {
       const result=await api('/api/game?title='+encodeURIComponent(match[1]));
       if(request!==routeRequest)return;
@@ -30,6 +46,7 @@ async function showRoute() {
       game=Array.isArray(titles) ? titles.find(g=>String(field(g,'TitleId','titleId'))===match[1]) : null;
       if (!game) throw new Error('XAU could not find a game with this Title ID.');
     } catch(e) { if(request===routeRequest){renderGames();error(e)} return; }
+    finally {loading($('#gameCount'),false);}
     renderGames();
   }
   openGame(game);
@@ -45,26 +62,25 @@ async function refreshLogin(){
     const signedIn=result.status==='signed_in'||result.status==='external';
     $('#loginPanel').hidden=signedIn;
     $('#profileCard').hidden=!signedIn;$('#goGames').hidden=!signedIn;$('#signOut').hidden=result.status!=='signed_in';
-    $('#tokenButton').disabled=tokenPending||result.status==='restoring';
-    if(!tokenPending&&result.status!==lastAuthStatus) $('#loginMessage').textContent=result.status==='restoring'?'Restoring saved token…':result.error||'';
+    $('#attachXbox').hidden=!result.pcSupported||signedIn;$('#attachXbox').disabled=tokenPending||result.status==='restoring';
+    if(!tokenPending) $('#loginMessage').textContent=result.autoAuth?.status==='connecting'?'Opening Xbox and connecting…':result.autoAuth?.error||result.error||(!result.pcSupported?'Xbox PC connection is available on Windows.':'');
     if((result.status==='signed_in'||result.status==='external')&&lastAuthStatus!==result.status){$('#alert').hidden=true;profile();if(!$('#games').hidden)loadGames();}
     if(result.status==='signed_out'||result.status==='error'){$('#profileCard').textContent='Sign in to load your profile.';}
     lastAuthStatus=result.status;
   } catch(e) {$('#loginMessage').textContent=e.message||'Sign-in unavailable';}
 }
 async function initLogin(){await refreshLogin();authPoll=setInterval(refreshLogin,3000);}
-$('#tokenForm').onsubmit=async event=>{
-  event.preventDefault();const input=$('#xauthToken'),button=$('#tokenButton');
-  const value=input.value.trim();input.value='';if(!value)return;
-  tokenPending=true;button.disabled=true;$('#loginMessage').textContent='Checking token…';
-  try{await api('/api/auth/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:value}),signal:AbortSignal.timeout(50000)});await refreshLogin()}
-  catch(e){$('#loginMessage').textContent=e.message||'Token sign-in failed'}finally{tokenPending=false;button.disabled=false}
+$('#attachXbox').onclick=async()=>{
+  if(tokenPending)return;
+  const button=$('#attachXbox');tokenPending=true;button.disabled=true;loading(button,true);$('#loginMessage').textContent='Connecting to the Xbox PC app…';
+  try{await api('/api/auth/attach',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',signal:AbortSignal.timeout(180000)});await refreshLogin()}
+  catch(e){$('#loginMessage').textContent=e.message||'Could not connect to the Xbox app'}finally{tokenPending=false;button.disabled=false;loading(button,false)}
 };
-$('#signOut').onclick=async()=>{const button=$('#signOut');button.disabled=true;try{await post('/api/auth/logout');profileAccount=null;completedTitles.clear();games=[];totals.clear();totalsQueue.length=0;totalsPending.clear();gameObserver?.disconnect();await refreshLogin();navigate('/')}catch(e){error(e)}finally{button.disabled=false}};
+$('#signOut').onclick=async()=>{const button=$('#signOut');button.disabled=true;loading(button,true);try{await post('/api/auth/logout');profileAccount=null;completedTitles.clear();games=[];totals.clear();totalsQueue.length=0;totalsPending.clear();gameObserver?.disconnect();await refreshLogin();navigate('/')}catch(e){error(e)}finally{button.disabled=false;loading(button,false)}};
 let profileAccount = null, profileUpdating = false, completedTitles = new Set();
 const profileKey = account => 'xau-profile-stats:' + account;
 function readProfileSnapshot(account) {
-  try { const snapshot=JSON.parse(localStorage.getItem(profileKey(account))); return snapshot && Number.isFinite(snapshot.unlocked) && Number.isFinite(snapshot.completed) && Number.isFinite(snapshot.total) ? snapshot : null; } catch { return null; }
+  try { const snapshot=JSON.parse(persistentStorage.getItem(profileKey(account))); return snapshot && Number.isFinite(snapshot.unlocked) && Number.isFinite(snapshot.completed) && Number.isFinite(snapshot.total) ? snapshot : null; } catch { return null; }
 }
 function drawProfileStats(snapshot) {
   const node=$('#profileStats');if(!node)return;
@@ -73,6 +89,7 @@ function drawProfileStats(snapshot) {
   $('#profileRefreshHint').textContent=snapshot?.updatedAt ? 'Updated ' + new Date(snapshot.updatedAt).toLocaleString() : 'Update to load your achievement stats';
 }
 async function profile() {
+  loading($('#profileCard'),true);
   try {
     const data=await api('/api/profile');const p=field(data,'People','people')?.[0] || data;
     const account=String(field(p,'Xuid','xuid')||'');if(!/^\d+$/.test(account))throw new Error('Could not identify the Xbox account.');
@@ -82,6 +99,7 @@ async function profile() {
     const snapshot=readProfileSnapshot(account);completedTitles=new Set(Array.isArray(snapshot?.completedTitles) ? snapshot.completedTitles.map(String).filter(title=>/^\d+$/.test(title)) : []);
     drawProfileStats(snapshot);if(games.length)renderGames();$('#refreshProfile').onclick=refreshProfileStats;
   } catch(e) {$('#profileCard').textContent='Could not load the profile.';error(e);}
+  finally {loading($('#profileCard'),false);}
 }
 async function refreshProfileStats() {
   if(profileUpdating || !profileAccount)return;
@@ -94,7 +112,7 @@ async function refreshProfileStats() {
     const list=field(gameData,'Titles','titles');if(!Array.isArray(list))throw new Error('Xbox did not return the game library.');
     let next=0, unlocked=0, total=0, completed=0, previousRequest=0;const completedIds=new Set();
     const totalsKey='xau-profile-totals:'+account;let savedTotals={};
-    try{savedTotals=JSON.parse(localStorage.getItem(totalsKey))||{};}catch{}
+    try{savedTotals=JSON.parse(persistentStorage.getItem(totalsKey))||{};}catch{}
     const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     async function getCount(title){
       const saved=savedTotals[title];if(saved && Number.isInteger(saved.count) && saved.count>=0 && Date.now()-saved.time<7*86400000)return saved.count;
@@ -104,7 +122,7 @@ async function refreshProfileStats() {
         try{
           const data=await api('/api/achievements?title='+encodeURIComponent(title));const achievements=field(data,'achievements','Achievements');
           if(!Array.isArray(achievements))throw new Error('Xbox did not return the achievement list.');
-          savedTotals[title]={count:achievements.length,time:Date.now()};try{localStorage.setItem(totalsKey,JSON.stringify(savedTotals));}catch{}
+          savedTotals[title]={count:achievements.length,time:Date.now()};try{persistentStorage.setItem(totalsKey,JSON.stringify(savedTotals));}catch{}
           return achievements.length;
         }catch(e){
           if(e.status!==429)throw e;
@@ -132,12 +150,12 @@ async function refreshProfileStats() {
     await worker();
     if(profileAccount!==account)return;
     const snapshot={score:Number(field(p,'GamerScore','gamerScore')||0),unlocked,total,completed,completedTitles:[...completedIds],updatedAt:Date.now()};
-    try{localStorage.setItem(profileKey(account),JSON.stringify(snapshot));}catch{}
+    try{persistentStorage.setItem(profileKey(account),JSON.stringify(snapshot));}catch{}
     completedTitles=completedIds;drawProfileStats(snapshot);if(games.length)renderGames();
   } catch(e) {if(profileAccount===account){drawProfileStats(readProfileSnapshot(account));error(e);}}
   finally {profileUpdating=false;if($('#refreshProfile')===button){button.disabled=false;button.classList.remove('is-updating');$('#profileUpdated').hidden=true;}}
 }
-async function loadGames() {if(gamesLoading)return gamesLoading;$('#gameCount').textContent='Loading…';gamesLoading=(async()=>{try {const data=await api('/api/games'); games=field(data,'Titles','titles') || []; renderGames();}catch(e){$('#gameCount').textContent='Loading failed';error(e)}finally{gamesLoading=null;}})();return gamesLoading;}
+async function loadGames() {if(gamesLoading)return gamesLoading;$('#gameCount').textContent='Loading…';loading($('#gameCount'),true);gamesLoading=(async()=>{try {const data=await api('/api/games'); games=field(data,'Titles','titles') || []; renderGames();}catch(e){$('#gameCount').textContent='Loading failed';error(e)}finally{gamesLoading=null;loading($('#gameCount'),false);}})();return gamesLoading;}
 function gameTotal(game) {
   const a=field(game,'Achievement','achievement')||{};
   const current=Number(field(a,'CurrentAchievements','currentAchievements')||0);
@@ -199,9 +217,9 @@ function renderGames(){
 }
 $('#search').oninput=renderGames;
 const filtersKey='xau-game-filters';
-function saveGameFilters(){try{localStorage.setItem(filtersKey,JSON.stringify({titleBased:$('#titleFilter').checked,hideEmpty:$('#hideEmpty').checked,hideCompleted:$('#hideCompleted').checked}));}catch{}}
+function saveGameFilters(){try{persistentStorage.setItem(filtersKey,JSON.stringify({titleBased:$('#titleFilter').checked,hideEmpty:$('#hideEmpty').checked,hideCompleted:$('#hideCompleted').checked}));}catch{}}
 async function restoreGameFilters(){
-  let saved;try{saved=JSON.parse(localStorage.getItem(filtersKey)||'{}')}catch{return;}
+  let saved;try{saved=JSON.parse(persistentStorage.getItem(filtersKey)||'{}')}catch{return;}
   $('#hideEmpty').checked=saved?.hideEmpty===true;$('#hideCompleted').checked=saved?.hideCompleted===true;
   if(saved?.titleBased===true){
     $('#titleFilter').checked=true;$('#titleFilter').disabled=true;
@@ -215,9 +233,9 @@ document.addEventListener('keydown',event=>{if(event.key==='Escape'&&$('.game-fi
 $('#titleFilter').onchange=async event=>{
   const checkbox=event.currentTarget;
   if(checkbox.checked&&!titleCatalog){
-    checkbox.disabled=true;$('#gameCount').textContent='Loading filter…';
+    checkbox.disabled=true;$('#gameCount').textContent='Loading filter…';loading($('#gameCount'),true);
     try{const result=await api('/api/title-based/catalog');titleCatalog=new Set(result.titles);}
-    catch(e){checkbox.checked=false;error(e)}finally{checkbox.disabled=false}
+    catch(e){checkbox.checked=false;error(e)}finally{checkbox.disabled=false;loading($('#gameCount'),false)}
   }
   saveGameFilters();renderGames();
 };
@@ -243,7 +261,7 @@ function renderGameProgress(game, list) {
   const score=earned!==null&&possible!==null?`${earned.toLocaleString()} <small>/ ${possible.toLocaleString()}</small>`:'—';
   card.innerHTML=`<div class="game-progress-top"><span class="game-progress-percent">${percent===null?'—':percent+'%'}</span></div><div class="game-progress-bar" role="progressbar" aria-label="Achievement progress" ${percent===null?'':`aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"`}><span style="width:${percent??0}%"></span></div><div class="game-progress-stats"><div><span>ACHIEVEMENTS</span><strong>${unlocked===null?'—':`${unlocked} <small>/ ${total}</small>`}</strong></div><div><span>GAMERSCORE</span><strong>${score}</strong></div></div>`;
 }
-async function openGame(game){const request=++gameRequest;selected=game;titleBased=null;achievements=[];clearHistory();$('#selectionControls').hidden=true;$('#historyInfo').textContent='';$('#historyList').innerHTML='';$('#tag').value='';$('#start').disabled=true;const name=field(game,'Name','name'), title=field(game,'TitleId','titleId');page('game');renderSpoof();$('#gameHead').innerHTML=`<div class="game-heading"><div class="game-heading-title"><div class="game-meta"><span class="eyebrow">GAME / ${esc(title)}</span><span id="titleBasedStatus" class="game-type" role="status">Checking title-based support…</span></div><h1>${esc(name)}<span>.</span></h1></div><aside id="gameProgress" class="game-progress-card" aria-label="Game progress" aria-live="polite"></aside></div>`;renderGameProgress(game,null);$('#taLink').href='https://www.trueachievements.com/searchresults.aspx?search='+encodeURIComponent(name);$('#achievementList').innerHTML='<p class="muted">Loading…</p>';checkTitleBased(title,request);try{const data=await fetchAchievements(title);if(request!==gameRequest)return;achievements=field(data,'achievements','Achievements')||[];if(Array.isArray(achievements))updateTotal(String(title),achievements.length);renderGameProgress(game,achievements);$('#achievementCount').textContent=achievements.length+' total';$('#achievementList').innerHTML=achievements.map(a=>{const image=a.mediaAssets?.[0]?.url;const unlocked=isUnlocked(a);return `<div class="achievement ${unlocked?'is-unlocked':'is-locked'}">${image?`<img src="${attr(image)}" alt="">`:'<div class="avatar" style="width:55px;height:55px;border-radius:8px;flex:none"></div>'}<div><strong>${esc(a.name)}</strong><span class="muted">${esc(a.description||a.lockedDescription||'')}</span></div><span class="achievement-status" aria-label="${unlocked?'Unlocked':'Locked'}" title="${unlocked?'Unlocked':'Locked'}"><span aria-hidden="true">${unlocked?'✓':'○'}</span><span>${unlocked?'Unlocked':'Locked'}</span></span></div>`}).join('')||'<p class="muted">No achievements found.</p>';}catch(e){if(request===gameRequest){$('#achievementList').innerHTML='<p class="muted">Could not load achievements.</p>';error(e)}}}
+async function openGame(game){const request=++gameRequest;selected=game;titleBased=null;achievements=[];clearHistory();$('#selectionControls').hidden=true;$('#historyInfo').textContent='';$('#historyList').innerHTML='';$('#tag').value='';$('#start').disabled=true;const name=field(game,'Name','name'), title=field(game,'TitleId','titleId');page('game');openSpoofPanel();resetStatsPanel();renderStatus();$('#gameHead').innerHTML=`<div class="game-heading"><div class="game-heading-title"><div class="game-meta"><span class="eyebrow">GAME / ${esc(title)}</span><span id="titleBasedStatus" class="game-type" role="status">Checking title-based support…</span></div><h1>${esc(name)}<span>.</span></h1></div><aside id="gameProgress" class="game-progress-card" aria-label="Game progress" aria-live="polite"></aside></div>`;renderGameProgress(game,null);$('#taLink').href='https://www.trueachievements.com/searchresults.aspx?search='+encodeURIComponent(name);$('#achievementList').innerHTML='<p class="muted loading-indicator" role="status">Loading achievements…</p>';checkTitleBased(title,request);try{const data=await fetchAchievements(title);if(request!==gameRequest)return;achievements=field(data,'achievements','Achievements')||[];if(Array.isArray(achievements))updateTotal(String(title),achievements.length);renderGameProgress(game,achievements);$('#achievementCount').textContent=achievements.length+' total';$('#achievementList').innerHTML=achievements.map(a=>{const image=a.mediaAssets?.[0]?.url;const unlocked=isUnlocked(a);return `<div class="achievement ${unlocked?'is-unlocked':'is-locked'}">${image?`<img src="${attr(image)}" alt="">`:'<div class="avatar" style="width:55px;height:55px;border-radius:8px;flex:none"></div>'}<div><strong>${esc(a.name)}</strong><span class="muted">${esc(a.description||a.lockedDescription||'')}</span></div><span class="achievement-status" aria-label="${unlocked?'Unlocked':'Locked'}" title="${unlocked?'Unlocked':'Locked'}"><span aria-hidden="true">${unlocked?'✓':'○'}</span><span>${unlocked?'Unlocked':'Locked'}</span></span></div>`}).join('')||'<p class="muted">No achievements found.</p>';}catch(e){if(request===gameRequest){$('#achievementList').innerHTML='<p class="muted">Could not load achievements.</p>';error(e)}}}
 async function checkTitleBased(title,request){
   try {const result=await api('/api/title-based?title='+encodeURIComponent(title));if(request!==gameRequest)return;titleBased=result.titleBased;$('#titleBasedStatus').textContent=titleBased===true?'Title Based':titleBased===false?'Title Based: no — copying unavailable':'Title Based: unknown — copying unavailable';}
   catch(e){if(request!==gameRequest)return;titleBased=null;$('#titleBasedStatus').textContent='Could not check title-based support — copying unavailable';error(e)}
@@ -253,8 +271,8 @@ function historyMessage(message, isError=false){const el=$('#historyMessage');el
 function clearHistory(){if(!$('#referenceDialog').hidden)$('#referenceNext').disabled=true;historyMessage('');$('#timingOptions').hidden=true;$('#totalHours').value='';entries=[];$('#historyInfo').textContent='';$('#historyList').innerHTML='';$('#selectionControls').hidden=true;$('#start').disabled=true;}
 function isUnlocked(a){return String(a.progressState||'').toLowerCase()==='achieved'||(!a.progressState&&Boolean(a.timeUnlocked)&&Date.parse(a.timeUnlocked)>0);}
 function selectionKey(){return 'xau-selection:'+String(field(selected,'TitleId','titleId'));}
-function savedSelection(){try{return JSON.parse(localStorage.getItem(selectionKey())||'{}')}catch{return {}}}
-function saveSelection(){try{const choices=savedSelection();for(const entry of entries)choices[entry.id]=entry.selected;localStorage.setItem(selectionKey(),JSON.stringify(choices))}catch{}}
+function savedSelection(){try{return JSON.parse(persistentStorage.getItem(selectionKey())||'{}')}catch{return {}}}
+function saveSelection(){try{const choices=savedSelection();for(const entry of entries)choices[entry.id]=entry.selected;persistentStorage.setItem(selectionKey(),JSON.stringify(choices))}catch{}}
 function prepare(rows){clearHistory();const index=new Map();for(const a of achievements){const n=String(a.name||'').trim().toLocaleLowerCase();if(index.has(n)) index.set(n,null);else index.set(n,a);}let problems=[];entries=rows.map(row=>{const a=row.id != null ? achievements.find(item=>String(item.id)===String(row.id)) : index.get(row.name.trim().toLocaleLowerCase());if(!a){problems.push(row.name);return null;}if(!Number.isFinite(Date.parse(row.time))){problems.push(row.name+' (invalid timestamp)');return null;}return {id:String(a.id),name:a.name,time:new Date(row.time).toISOString(),alreadyUnlocked:isUnlocked(a)};}).filter(Boolean).sort((a,b)=>Date.parse(a.time)-Date.parse(b.time));if(problems.length){entries=[];throw new Error('Could not match or read the timestamp for: '+problems.slice(0,8).join(', '));}if(!entries.length)throw new Error('The history is empty.');if(new Set(entries.map(x=>x.id)).size!==entries.length){entries=[];throw new Error('The history contains duplicate achievements.');}const saved=savedSelection();entries=entries.map(x=>({...x,selected:typeof saved[x.id]==='boolean'?saved[x.id]:!x.alreadyUnlocked}));$('#selectionControls').hidden=false;$('#timingOptions').hidden=false;renderHistory();if(!$('#referenceDialog').hidden)$('#referenceNext').disabled=false;}
 function renderHistory(){
   const count=entries.filter(x=>x.selected).length;
@@ -282,25 +300,25 @@ $('#loadHistory').onclick=async()=>{
   try{
     if(!achievements.length)throw new Error('Wait for the game’s achievements to load.');
     const tag=$('#tag').value.trim();if(!tag)throw new Error('Enter the player’s gamertag.');
-    $('#loadHistory').disabled=true;$('#loadHistory').textContent='Loading…';historyMessage('Loading the player’s Xbox history…');
+    $('#loadHistory').disabled=true;loading($('#loadHistory'),true);$('#loadHistory').textContent='Loading…';historyMessage('Loading the player’s Xbox history…');
     const title=String(field(selected,'TitleId','titleId'));
     const result=await api('/api/history?'+new URLSearchParams({title,tag}),{signal:AbortSignal.timeout(120000)});
     if(request===gameRequest&&session===referenceSession){prepare(result.entries);if(Number.isFinite(result.minutesPlayed)&&result.minutesPlayed>0){$('#totalHours').value=String(Math.round(result.minutesPlayed/60*100)/100);renderHistory();}}
   }catch(e){if(request===gameRequest&&session===referenceSession){$('#start').disabled=true;historyMessage(e.message||'Loading failed',true)}}
-  finally{historyLoading=false;$('#loadHistory').disabled=false;$('#loadHistory').textContent='Load history'}
+  finally{historyLoading=false;loading($('#loadHistory'),false);$('#loadHistory').disabled=false;$('#loadHistory').textContent='Load history'}
 };
-$('#start').onclick=async()=>{if(actionLoading||titleBased!==true)return;let chosen;try{chosen=planSelected(entries,$('#totalHours').value)}catch(e){historyMessage(e.message,true);return;}if(!chosen.length)return;actionLoading=true;actionVersion++;$('#start').disabled=true;try{job=await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({titleId:String(field(selected,'TitleId','titleId')),game:field(selected,'Name','name'),tag:$('#tag').value,entries:chosen}),signal:AbortSignal.timeout(50000)});renderStatus();}catch(e){historyMessage(e.message||String(e),true)}finally{actionLoading=false;renderHistory()}};
+$('#start').onclick=async()=>{if(actionLoading||titleBased!==true)return;let chosen;try{chosen=planSelected(entries,$('#totalHours').value)}catch(e){historyMessage(e.message,true);return;}if(!chosen.length)return;actionLoading=true;actionVersion++;$('#start').disabled=true;loading($('#start'),true);try{job=await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({titleId:String(field(selected,'TitleId','titleId')),game:field(selected,'Name','name'),tag:$('#tag').value,entries:chosen}),signal:AbortSignal.timeout(50000)});renderStatus();}catch(e){historyMessage(e.message||String(e),true)}finally{actionLoading=false;loading($('#start'),false);renderHistory()}};
 $('#applySchedule').onclick=async()=>{
   if(actionLoading)return;let chosen;try{chosen=planSelected(entries,$('#totalHours').value)}catch(e){historyMessage(e.message,true);return;}
-  actionLoading=true;actionVersion++;$('#applySchedule').disabled=true;
+  actionLoading=true;actionVersion++;$('#applySchedule').disabled=true;loading($('#applySchedule'),true);
   try{job=await api('/api/reschedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({titleId:String(field(selected,'TitleId','titleId')),tag:$('#tag').value,entries:chosen})});historyMessage('Paused queue updated. Review it before resuming.');if(!$('#referenceDialog').hidden)closeReferenceEditor();renderStatus()}
-  catch(e){if(!referenceDialog.hidden){$('#referenceDialogHint').textContent=e.message||String(e);$('#referenceDialogHint').hidden=false}else historyMessage(e.message||String(e),true)}finally{actionLoading=false;renderHistory()}
+  catch(e){if(!referenceDialog.hidden){$('#referenceDialogHint').textContent=e.message||String(e);$('#referenceDialogHint').hidden=false}else historyMessage(e.message||String(e),true)}finally{actionLoading=false;loading($('#applySchedule'),false);renderHistory()}
 };
-for(const action of ['pause','resume','reset'])$('#'+action).onclick=async()=>{if(actionLoading)return;actionLoading=true;actionVersion++;$('#'+action).disabled=true;try{if(action==='resume'&&job.uncertainId){const result=await api('/api/uncertain',{signal:AbortSignal.timeout(45000)});uncertainShown=result.id;$('#uncertainStatus').textContent=`XAU status: ${result.progress==='achieved'?'unlocked':'not yet unlocked'}. Choose how to continue.`;$('#uncertain').hidden=false;}else{job=await post('/api/'+action);uncertainShown=null;renderStatus()}}catch(e){$('#status').textContent=e.message||String(e)}finally{actionLoading=false;$('#'+action).disabled=false}};
-for(const [button,choice] of [['skipUncertain','skip'],['retryUncertain','retry']])$('#'+button).onclick=async()=>{if(actionLoading||!uncertainShown)return;actionLoading=true;actionVersion++;$('#skipUncertain').disabled=$('#retryUncertain').disabled=true;try{job=await api('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,id:uncertainShown}),signal:AbortSignal.timeout(45000)});uncertainShown=null;renderStatus()}catch(e){$('#uncertainStatus').textContent=e.message||String(e)}finally{actionLoading=false;$('#skipUncertain').disabled=$('#retryUncertain').disabled=false}};
+for(const action of ['pause','resume','reset'])$('#'+action).onclick=async()=>{if(actionLoading)return;actionLoading=true;actionVersion++;$('#'+action).disabled=true;loading($('#'+action),true);try{if(action==='resume'&&job.uncertainId){const result=await api('/api/uncertain',{signal:AbortSignal.timeout(45000)});uncertainShown=result.id;$('#uncertainStatus').textContent=`XAU status: ${result.progress==='achieved'?'unlocked':'not yet unlocked'}. Choose how to continue.`;$('#uncertain').hidden=false;}else{job=await post('/api/'+action);uncertainShown=null;renderStatus()}}catch(e){$('#status').textContent=e.message||String(e)}finally{actionLoading=false;$('#'+action).disabled=false;loading($('#'+action),false)}};
+for(const [button,choice] of [['skipUncertain','skip'],['retryUncertain','retry']])$('#'+button).onclick=async()=>{if(actionLoading||!uncertainShown)return;actionLoading=true;actionVersion++;$('#skipUncertain').disabled=$('#retryUncertain').disabled=true;loading($('#'+button),true);try{job=await api('/api/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice,id:uncertainShown}),signal:AbortSignal.timeout(45000)});uncertainShown=null;renderStatus()}catch(e){$('#uncertainStatus').textContent=e.message||String(e)}finally{actionLoading=false;$('#skipUncertain').disabled=$('#retryUncertain').disabled=false;loading($('#'+button),false)}};
 
 function duration(ms){let n=Math.ceil(Math.max(0,ms)/1000),d=Math.floor(n/86400);n%=86400;return `${d?d+'d ':''}${String(Math.floor(n/3600)).padStart(2,'0')}:${String(Math.floor(n%3600/60)).padStart(2,'0')}:${String(n%60).padStart(2,'0')}`;}
-let queueHasSchedule = false;
+let queueHasSchedule = false, viewingOtherQueue = false, previousQueueExpanded = true;
 function setQueueExpanded(expanded){$('#queueBody').hidden=!expanded;$('#queueSummary').hidden=expanded;$('#toggleQueuePanel').setAttribute('aria-expanded',String(expanded));$('#toggleQueuePanel').innerHTML=expanded?'Collapse <span aria-hidden="true">↑</span>':'Expand <span aria-hidden="true">↓</span>'; }
 $('#toggleQueuePanel').onclick=()=>setQueueExpanded($('#queueBody').hidden);
 const referenceDialog=$('#referenceDialog'),queueSetup=$('#queueSetup'),setupHome=queueSetup.parentElement;
@@ -318,7 +336,26 @@ $('#referenceClose').onclick=()=>closeReferenceEditor();
 $('#referenceNext').onclick=()=>{if(entries.length){referenceStep(2);renderHistory()}};
 $('#referenceBack').onclick=()=>referenceStep(1);
 function closeReferenceEditor(){if(referenceDialog.hidden)return;referenceSession++;referenceDialog.hidden=true;setupHome.prepend(queueSetup);queueSetup.hidden=true;$('.queue-workspace').hidden=false;$('.queue-details').hidden=false;$('#referenceStep').hidden=false;$('#reviewStep').hidden=false;$('#toggleQueueSetup').setAttribute('aria-expanded','false');$('#toggleQueueSetup').focus()}
+$('#openOtherQueue').onclick=()=>{if(/^\d+$/.test(String(job.titleId)))navigate('/games/'+job.titleId)};
+$('#resetOtherQueue').onclick=async()=>{
+  if(actionLoading||job.status==='running')return;
+  actionLoading=true;actionVersion++;$('#resetOtherQueue').disabled=true;loading($('#resetOtherQueue'),true);
+  try{job=await api('/api/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({titleId:job.titleId})});uncertainShown=null;renderStatus();}
+  catch(e){error(e)}finally{actionLoading=false;loading($('#resetOtherQueue'),false);renderStatus();}
+};
 function renderStatus(){
+  const otherGame=Boolean(selected && job.entries?.length && String(job.titleId)!==String(field(selected,'TitleId','titleId')));
+  $('#otherQueue').hidden=!otherGame;
+  if(otherGame){
+    if(!viewingOtherQueue){previousQueueExpanded=!$('#queueBody').hidden;viewingOtherQueue=true;if(!referenceDialog.hidden)closeReferenceEditor();}
+    $('#queueBody').hidden=true;$('#queueSummary').hidden=true;$('#queueBadge').hidden=true;$('#toggleQueuePanel').hidden=true;
+    const label=job.status==='running'?'running':job.status==='paused'?'paused':'completed';
+    $('#otherQueueText').textContent=`A ${label} queue belongs to ${job.game||'Title ID '+job.titleId}. ${job.status==='running'?'Pause it before resetting.':'Reset it to create a queue for this game.'}`;
+    $('#resetOtherQueue').disabled=job.status==='running'||actionLoading;
+    return;
+  }
+  $('#queueBadge').hidden=false;
+  if(viewingOtherQueue){viewingOtherQueue=false;setQueueExpanded(job.entries?.length ? previousQueueExpanded : true);}
   const labels={idle:'Idle',running:'Running',paused:'Paused',completed:'Completed'};
   const active=job.status==='running'||job.status==='paused';
   const hasSchedule=Boolean(job.entries?.length);
@@ -353,26 +390,8 @@ function renderStatus(){
   $('#queueList').innerHTML=(job.entries||[]).map((item,i)=>{const gap=Number.isSafeInteger(item.delayMs)?item.delayMs:(i?Date.parse(item.time)-Date.parse(job.entries[i-1].time):0);const status=i<job.index?({'sent':'sent','already':'already unlocked','skipped':'skipped'}[job.results?.[item.id]]||'processed'):i===job.index&&job.status!=='completed'?'next':'pending';return `<div class="queue-row"><strong>${i+1}. ${esc(item.name)}</strong><span>${esc(status)} · ${esc(new Date(item.time).toLocaleString())} · planned interval ${duration(gap)}</span></div>`}).join('');
   $('#queueLog').innerHTML=(job.log||[]).slice().reverse().map(row=>`<div class="queue-row"><span>${esc(new Date(row.time).toLocaleString())} · ${esc(row.message)}</span></div>`).join('');
 }
-let spoofState={status:'idle'}, spoofBusy=false, spoofVersion=0;
-function renderSpoof(){
-  const active=spoofState.status==='running', title=String(field(selected,'TitleId','titleId')||'');
-  $('#spoofButton').textContent=active?'Stop spoof':'Start spoof';
-  $('#spoofButton').disabled=spoofBusy||!title;
-  $('#spoofStatus').textContent=active ? `Spoofing ${spoofState.titleId===title?'this game':'Title ID '+spoofState.titleId} · ${duration(Date.now()-spoofState.startedAt)}` : spoofState.error ? `Spoof stopped: ${spoofState.error}` : spoofState.notice || 'Spoof off';
-}
-$('#spoofButton').onclick=async()=>{
-  if(spoofBusy||!selected)return;
-  spoofBusy=true;spoofVersion++;renderSpoof();
-  try {
-    const active=spoofState.status==='running';
-    spoofState=await api('/api/spoofer/'+(active?'stop':'start'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(active?{}:{titleId:String(field(selected,'TitleId','titleId'))}),signal:AbortSignal.timeout(50000)});
-  } catch(e){error(e)} finally{spoofBusy=false;renderSpoof()}
-};
-async function pollSpoof(){
-  if(spoofBusy)return;const version=spoofVersion;
-  try{const next=await api('/api/spoofer');if(!spoofBusy&&version===spoofVersion){spoofState=next;renderSpoof()}}catch{}
-}
-setInterval(pollSpoof,1000);pollSpoof();
+const openSpoofPanel = initSpoofPanel(() => selected && String(field(selected,'TitleId','titleId')));
+const resetStatsPanel = initStatsPanel(() => selected && String(field(selected,'TitleId','titleId')));
 async function poll(){if(polling||actionLoading)return;polling=true;const version=actionVersion;try{const next=await api('/api/state');if(!actionLoading&&version===actionVersion){job=next;renderStatus()}}catch(e){$('#status').textContent='Cannot connect to the app. Queue status is unknown.'}finally{polling=false}}setInterval(poll,1000);restoreGameFilters().finally(()=>{showRoute();initLogin();poll()});
 
 // Each tab has its own lease. A short grace period on the server allows reloads.

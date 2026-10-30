@@ -2,10 +2,24 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, chmod, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { createInterface } from 'node:readline';
+
+test('server reports its assigned port for the desktop window', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'xau-desktop-test-'));
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',AUTH_FILE:join(dir,'auth.json'),STATE_FILE:join(dir,'state.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const url=await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>reject(new Error('server did not start')),5000);
+      createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timeout);resolve(match[1]);}});
+      child.once('exit',()=>{clearTimeout(timeout);reject(new Error('server exited'));});
+    });
+    assert.notEqual(new URL(url).port,'0');assert.equal((await fetch(url+'/api/state')).status,200);
+  } finally {if(child.exitCode===null && child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await rm(dir,{recursive:true,force:true});}
+});
 
 test('queue persists, pauses and resumes without unlockall', async () => {
   const calls=[]; let account='9999';
@@ -18,8 +32,7 @@ test('queue persists, pauses and resumes without unlockall', async () => {
   const post=async(path,data={})=>{const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(data)});assert.equal(r.status,200);return r.json()};
   try {
     for(let i=0;i<40;i++){try{await fetch(base+'/api/state');break}catch{await sleep(50)}}
-    for (const path of ['/games', '/games/123']) { const response=await fetch(base+path); assert.equal(response.status,200); const html=await response.text();assert.match(html, /XAU Companion/);assert.doesNotMatch(html, /dev-reload\.js/); }
-    assert.equal((await fetch(base+'/api/dev/version')).status,404);
+    for (const path of ['/games', '/games/123']) { const response=await fetch(base+path); assert.equal(response.status,200); const html=await response.text();assert.match(html, /Xbox Achievment Hunter/); }
     const game=await (await fetch(base+'/api/game?title=123')).json();assert.equal(game.Titles[0].Name,'Test game');
     await fetch(base+'/api/game?title=123');assert.equal(calls.filter(x=>x==='/api/games/search/titleid/123').length,1);
     await post('/api/cache/refresh');await fetch(base+'/api/game?title=123');assert.equal(calls.filter(x=>x==='/api/games/search/titleid/123').length,2);
@@ -31,6 +44,7 @@ test('queue persists, pauses and resumes without unlockall', async () => {
     assert.deepEqual(simultaneous.map(r=>r.status).sort(),[200,400]);
     for(let i=0;i<40;i++){const state=await (await fetch(base+'/api/state')).json();if(state.index===1)break;await sleep(50)}
     const paused=await post('/api/pause');assert.equal(paused.status,'paused');assert.equal(paused.index,1);assert.ok(paused.remaining>115000);
+    const wrongReset=await fetch(base+'/api/reset',{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({titleId:'456'})});assert.equal(wrongReset.status,400);assert.equal((await (await fetch(base+'/api/state')).json()).titleId,'123');
     const persisted=JSON.parse(await readFile(stateFile,'utf8'));assert.equal(persisted.index,1);assert.deepEqual(persisted.entries.map(a=>a.id),['1','3']);
     const revised=await post('/api/reschedule',{titleId:'123',tag:'Player',entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z',delayMs:0},{id:'3',name:'Third',time:'2025-01-01T00:02:00Z',delayMs:1800000}]});
     assert.equal(revised.index,1);assert.equal(revised.entries[1].delayMs,1800000);assert.ok(revised.remaining>1790000);assert.equal(revised.tag,'Player');
@@ -72,7 +86,7 @@ test('request errors pause and persist the queue without retrying', async () => 
     const check=await (await fetch(base+'/api/uncertain')).json();assert.equal(check.progress,'notstarted');
     const skipped=await request('/api/resolve',{id:'1',choice:'skip'});assert.equal(skipped.status,'completed');assert.equal(skipped.results['1'],'skipped');assert.ok(skipped.log.some(x=>x.message.includes('Skipped by user')));
     await request('/api/reset'); mode='owned'; const unlockCount=calls.filter(x=>x==='/api/achievements/unlock').length;
-    await request('/api/start', {titleId:'123', spoofEnabled:false, entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z'}]});
+    await request('/api/start', {titleId:'123', entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z'}]});
     for(let i=0;i<60;i++){state=await (await fetch(base+'/api/state')).json();if(state.status==='completed')break;await sleep(50)}
     assert.equal(state.status,'completed');assert.equal(calls.filter(x=>x.startsWith('/api/spoof/')).length,spoofCount);assert.equal(calls.filter(x=>x==='/api/achievements/unlock').length,unlockCount);
   } finally { child.kill(); await new Promise(r=>child.once('exit',r)); await new Promise(r=>mock.close(r)); await rm(dir,{recursive:true,force:true}); }
@@ -134,9 +148,10 @@ test('standalone spoof starts and stops independently of the queue', async () =>
     for(let i=0;i<40;i++){try{await fetch(base+'/api/state');break}catch{await sleep(50)}}
     const started=await send('/api/spoofer/start',{titleId:'123'});assert.equal(started.status,200);const state=await started.json();
     assert.equal(state.status,'running');assert.equal(state.titleId,'123');assert.equal(state.accountXuid,undefined);assert.ok(state.nextHeartbeat-state.startedAt===290000);
+    assert.equal(JSON.parse(await readFile(join(dir,'state.json.spoof'),'utf8')).titleId,'123');
     assert.equal((await (await fetch(base+'/api/state')).json()).status,'idle');
     assert.equal((await send('/api/spoofer/start',{titleId:'123'})).status,400);
-    const stopped=await (await send('/api/spoofer/stop')).json();assert.equal(stopped.status,'idle');assert.match(stopped.notice,/expires/);
+    const stopped=await (await send('/api/spoofer/stop')).json();assert.equal(stopped.status,'idle');assert.match(stopped.notice,/expires/);assert.ok(stopped.endedAt);assert.equal(JSON.parse(await readFile(join(dir,'state.json.spoof'),'utf8')).status,'idle');
     await sleep(1200);assert.equal(calls.filter(x=>x==='/api/spoof/123').length,1);
   } finally {child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });
@@ -165,17 +180,6 @@ test('unlock requests are spaced and the journal records them', async () => {
   }finally{child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });
 
-test('launcher opens the app only after the server starts', {skip:process.platform==='win32'}, async () => {
-  const dir=await mkdtemp(join(tmpdir(),'xau-launch-test-'));const probe=http.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
-  const opener=join(dir,process.platform==='darwin'?'open':'xdg-open');const output=join(dir,'opened');
-  await writeFile(opener,'#!/bin/sh\nprintf "%s" "$1" > "$LAUNCH_TEST_OUTPUT"\n');await chmod(opener,0o755);
-  const child=spawn(process.execPath,['launch.js'],{env:{...process.env,PORT:String(port),AUTH_FILE:join(dir,'auth.json'),STATE_FILE:join(dir,'state.json'),PATH:dir+':'+process.env.PATH,LAUNCH_TEST_OUTPUT:output},stdio:'ignore'});
-  try {
-    let url;for(let i=0;i<60;i++){try{url=await readFile(output,'utf8');break}catch{await sleep(50)}}
-    assert.equal(url,`http://127.0.0.1:${port}`);assert.equal((await fetch(url+'/api/state')).status,200);
-  } finally {child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));await rm(dir,{recursive:true,force:true});}
-});
-
 test('server stops after the last browser tab closes', async () => {
   const dir=await mkdtemp(join(tmpdir(),'xau-close-test-'));const probe=http.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
   const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:String(port),AUTH_FILE:join(dir,'auth.json'),STATE_FILE:join(dir,'state.json')},stdio:'ignore'});
@@ -191,4 +195,28 @@ test('server stops after the last browser tab closes', async () => {
     for(let i=0;i<250&&!exited;i++)await sleep(100);
     assert.equal(exited,true);
   } finally {if(!exited){child.kill();await new Promise(r=>child.once('exit',r));}await rm(dir,{recursive:true,force:true});}
+});
+
+test('game playtime and settings persist independently of the server port', async () => {
+  const mock=http.createServer(async(req,res)=>{
+    res.setHeader('Content-Type','application/json');
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url==='/api/xauth?format=json')return res.end(JSON.stringify({token:'private-test-token'}));
+    if(req.url==='/batch') {let data='';for await(const chunk of req)data+=chunk;assert.equal(JSON.parse(data).Stats[0].TitleId,'123');return res.end(JSON.stringify({statListsCollection:[{stats:[{name:'MinutesPlayed',value:'135'}]}]}));}
+    res.statusCode=404;res.end('{}');
+  });
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+  const mockOrigin=`http://127.0.0.1:${mock.address().port}`,dir=await mkdtemp(join(tmpdir(),'xau-settings-test-'));
+  async function launch(){const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_URL:mockOrigin,XBOX_USERSTATS_ORIGIN:mockOrigin,STATE_FILE:join(dir,'state.json')},stdio:['ignore','pipe','ignore']});const base=await new Promise((resolve,reject)=>{createInterface({input:child.stdout}).on('line',line=>{const m=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(m)resolve(m[1]);});child.once('exit',()=>reject(new Error('server exited')))});return {child,base};}
+  let instance;
+  try {
+    instance=await launch();let {child,base}=instance;
+    const play=await (await fetch(base+'/api/playtime?title=123')).json();assert.equal(play.minutesPlayed,135);assert.ok(play.updatedAt);
+    assert.equal((await fetch(base+'/spoof-panel.js')).status,200);
+    const options={method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({key:'xau-game-filters',value:'{"hideEmpty":true}'})};
+    assert.equal((await fetch(base+'/api/settings',options)).status,200);
+    assert.equal((await fetch(base+'/api/auth/token',{...options,body:'{}'})).status,404);
+    child.kill();await new Promise(r=>child.once('exit',r));instance=null;
+    instance=await launch();assert.equal((await (await fetch(instance.base+'/api/settings')).json())['xau-game-filters'],'{"hideEmpty":true}');
+  } finally {if(instance){instance.child.kill();await new Promise(r=>instance.child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });

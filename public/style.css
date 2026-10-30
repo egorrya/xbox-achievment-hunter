@@ -165,7 +165,6 @@ main{width:min(var(--content-width),calc(100% - 2 * var(--page-gutter)));max-wid
 .game-type{color:#a6ed6b;font-size:11px;letter-spacing:2px;font-weight:700;text-transform:uppercase}.game-type::before{color:#a6ed6b}
 .game-heading{display:flex;align-items:center;justify-content:space-between;gap:32px}.game-heading-title{min-width:0}.game-heading-title h1{overflow-wrap:anywhere}.game-progress-card{width:320px;flex:none;padding:19px 22px;border:1px solid #35513c;border-radius:15px;background:linear-gradient(145deg,#1d3425,#14231a);box-shadow:0 12px 32px #0002}.game-progress-top{display:flex;align-items:center;justify-content:space-between;gap:16px}.game-progress-label,.game-progress-stats span{color:#91aa98;font-size:10px;font-weight:700;letter-spacing:1.3px}.game-progress-percent{color:#b5f380;font:700 23px 'Space Grotesk',sans-serif}.game-progress-bar{height:5px;margin:13px 0 18px;overflow:hidden;border-radius:5px;background:#304838}.game-progress-bar span{display:block;height:100%;border-radius:inherit;background:#a6ed6b}.game-progress-stats{display:grid;grid-template-columns:1fr 1fr;gap:18px}.game-progress-stats span,.game-progress-stats strong{display:block}.game-progress-stats strong{margin-top:6px;color:#eef7ef;font:700 20px 'Space Grotesk',sans-serif}.game-progress-stats small{color:#91aa98;font-size:14px;font-weight:400}
 @media(max-width:750px){.game-heading{align-items:stretch;flex-direction:column;gap:18px}.game-progress-card{width:100%;max-width:420px}.game-heading-title h1{margin-bottom:0}}
-.spoof-setting{display:flex;align-items:flex-start;gap:10px;margin:18px 0 0;color:#c5d8c9;cursor:pointer}.spoof-setting input{width:auto;flex:none;margin:3px 0 0;accent-color:#a6ed6b}.spoof-setting strong,.spoof-setting small{display:block}.spoof-setting strong{font-size:13px}.spoof-setting small{margin-top:4px;color:#91a69a;font-size:12px;font-weight:400;line-height:1.4}.spoof-setting:has(input:disabled){opacity:.65;cursor:default}
 @media(min-width:1001px){
   .library-controls .toolbar>input,.library-controls .game-lookup>a,.library-controls .game-lookup form{height:48px}
   .library-controls .game-lookup>a{display:inline-flex;align-items:center}
@@ -218,3 +217,30 @@ main{width:min(var(--content-width),calc(100% - 2 * var(--page-gutter)));max-wid
 @media(max-width:600px){#referenceDialog .reference-field{grid-column:1}#referenceDialog #loadHistory{grid-column:1}}
 .spoof-control{display:flex;align-items:center;gap:10px}.spoof-control #spoofStatus{max-width:260px;color:#a9c1ad;font-size:12px;text-align:right}.spoof-control button{white-space:nowrap}
 @media(max-width:700px){.queue-heading{align-items:flex-start;flex-wrap:wrap}.queue-heading-actions{flex-wrap:wrap}.spoof-control #spoofStatus{text-align:left}}
+.other-queue{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 0 2px;color:#b8cdbb;font-size:14px}.other-queue .text-button{white-space:nowrap}@media(max-width:600px){.other-queue{align-items:flex-start;flex-direction:column;gap:8px}}
+.other-queue-actions{display:flex;align-items:center;flex-wrap:wrap;gap:12px}
+/* Small loading indicators keep the surrounding layout stable. */
+.is-loading::before,.loading-indicator::before{content:"";display:inline-block;width:14px;height:14px;flex:none;margin-right:9px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-2px;animation:loading-spin .8s linear infinite}
+button.is-loading{opacity:.8;cursor:wait}button.is-loading::before{vertical-align:-2px}.login-button.is-loading::before{margin-right:0}
+#profileCard.is-loading::before{color:#a6ed6b}.loading-indicator{padding:18px 4px}
+@keyframes loading-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.is-loading::before,.loading-indicator::before{animation:none}}
+#attachXbox{margin:0 0 14px}
+
+/* Keep the sign-in screen comfortably within the window when space permits. */
+html,body{min-height:100%;background:#0d1512}
+main:has(#loginPanel:not([hidden])){padding-top:clamp(24px,5vh,48px);padding-bottom:clamp(24px,5vh,48px)}
+@media(max-height:800px){
+  #profile:has(#loginPanel:not([hidden]))>h1{margin-bottom:18px;font-size:clamp(36px,6vh,52px)}
+  .login-main{padding:clamp(20px,3vh,32px)}
+  .login-mark{margin-bottom:16px}
+  .login-subtitle{margin:8px 0 16px}
+  .login-button{min-height:48px}
+}
+
+/* Flat surfaces prevent gradient banding around the sign-in panel. */
+html,body,main{background:#0d1512}
+.login-panel{box-shadow:none}
+
+/* Game presence and game detail tabs */
+.spoof-panel{margin-top:30px;padding:24px 28px;border:1px solid #304735;border-radius:16px;background:#14231a}.spoof-panel-head{display:flex;justify-content:space-between;align-items:center;gap:16px}.spoof-panel-head h2{font-size:22px;margin:5px 0 0}.spoof-panel-body{display:grid;grid-template-columns:1fr 1fr auto;align-items:center;gap:24px;margin-top:22px}.spoof-metric span,.spoof-metric small{display:block;color:#91a99a;font-size:11px}.spoof-metric span{font-weight:700;letter-spacing:1px}.spoof-metric strong{display:block;font-size:22px;margin:8px 0;font-variant-numeric:tabular-nums}.spoof-panel-actions{display:flex;align-items:center;gap:12px}.spoof-panel-actions .text-button{color:#b8ef90}.spoof-panel #spoofMessage{margin:18px 0 0;color:#a1b4a6;font-size:13px;line-height:1.5}.game-tabs{display:flex;gap:20px;align-items:center}.game-tabs button{background:none;color:#81978a;padding:0 0 10px;font:700 22px 'Space Grotesk',sans-serif;border-bottom:2px solid transparent}.game-tabs button[aria-selected=true]{color:#edf7ef;border-color:#a6ed6b}.game-tabs button:focus-visible,.spoof-panel button:focus-visible,.stats-toolbar button:focus-visible,.stat-row button:focus-visible,.stat-row input:focus-visible{outline:2px solid #a6ed6b;outline-offset:3px}.stats-toolbar{display:flex;justify-content:space-between;align-items:center;gap:16px}.stats-toolbar h3{margin:0;font-size:20px}.stats-toolbar p{color:#91a69a;font-size:13px}.stat-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(120px,180px) auto;gap:14px;align-items:center;padding:16px 4px;border-bottom:1px solid #293c30}.stat-name strong,.stat-name small{display:block;overflow-wrap:anywhere}.stat-name small{color:#91a69a;margin-top:5px}.stat-feedback{grid-column:1/-1;color:#a1b4a6;font-size:13px}.stat-row input{min-width:0}.stat-row input:disabled{opacity:.5}@media(max-width:800px){.spoof-panel-body{grid-template-columns:1fr 1fr}.spoof-panel-actions{grid-column:1/-1;justify-content:space-between}}@media(max-width:520px){.spoof-panel{padding:20px}.stat-row{grid-template-columns:1fr auto}.stat-name{grid-column:1/-1}.game-tabs button{font-size:19px}}

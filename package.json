@@ -1,14 +1,25 @@
 {
-  "name": "xau-companion",
+  "name": "xbox-achievment-hunter",
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "main": "desktop.js",
   "scripts": {
-    "start": "node server.js",
     "test": "node --test",
-    "dev": "node dev.js"
+    "build:win": "electron-builder --win portable --x64"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.xboxachievmenthunter.desktop",
+    "productName": "Xbox Achievment Hunter",
+    "asar": false,
+    "files": ["desktop.js", "server.js", "stats.js", "xbox-client.js", "windows-auth.js", "public/**/*", "windows/**/*", "build/icon.png", "package.json"],
+    "win": { "icon": "build/icon.ico", "target": ["portable"], "artifactName": "Xbox-Achievment-Hunter-${version}-Windows.${ext}" }
   }
 }

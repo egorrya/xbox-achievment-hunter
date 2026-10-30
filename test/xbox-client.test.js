@@ -9,7 +9,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 const isolatedAuthDir=mkdtempSync(join(tmpdir(),'xau-auth-isolated-'));
 process.env.AUTH_FILE=join(isolatedAuthDir,'session.json');
 process.on('exit',()=>rmSync(isolatedAuthDir,{recursive:true,force:true}));
-const { createXboxApi, useXauth, loginStatus, signOut }=await import('../xbox-client.js');
+const { createXboxApi, useXauth, loginStatus, signOut, attachXboxPc }=await import('../xbox-client.js');
+const { readXboxPcCandidates }=await import('../windows-auth.js');
 
 test('Xbox adapter sends individual unlock and heartbeat requests', async () => {
   const calls=[]; const scid='12345678-1234-1234-1234-123456789abc';
@@ -18,7 +19,7 @@ test('Xbox adapter sends individual unlock and heartbeat requests', async () => 
     if(url.includes('/achievements?'))return new Response(JSON.stringify({achievements:[{id:'7',serviceConfigId:scid}]}),{status:200});
     return new Response('',{status:200});
   }});
-  const spoof=await xbox('/api/spoof/55');assert.equal(spoof.titleId,'55');assert.equal(calls[0].url,'https://presence-heartbeat.xboxlive.com/users/xuid(1234)/devices/current/');assert.equal(calls[0].options.headers['x-xbl-contract-version'],'3');assert.deepEqual(JSON.parse(calls[0].options.body),{titles:[{id:'55',expiration:600,state:'active',sandbox:'RETAIL'}]});
+  const spoof=await xbox('/api/spoof/55');assert.equal(spoof.titleId,'55');assert.equal(calls[0].url,'https://presence-heartbeat.xboxlive.com/users/xuid(1234)/devices/current/');assert.equal(calls[0].options.headers['x-xbl-contract-version'],'3');assert.deepEqual(JSON.parse(calls[0].options.body),{titles:[{expiration:600,id:'55',state:'active',sandbox:'RETAIL'}]});
   await xbox('/api/spoof-stop');assert.equal(calls[1].url,calls[0].url);assert.equal(calls[1].options.method,'DELETE');
   const result=await xbox('/api/achievements/unlock',{body:JSON.stringify({titleId:'55',achievementId:'7'})});assert.equal(result.achievementId,'7');
   const update=calls.find(c=>c.url.includes('/update'));const body=JSON.parse(update.options.body);
@@ -29,7 +30,7 @@ test('Xbox adapter sends individual unlock and heartbeat requests', async () => 
 
 test('Xbox adapter reports heartbeat and unlock HTTP errors', async () => {
   const xbox=createXboxApi({getToken:async()=>({userXUID:'1234',userHash:'hash',XSTSToken:'secret'}),fetcher:async()=>new Response('',{status:403})});
-  await assert.rejects(()=>xbox('/api/spoof/55'),/HTTP 403.*OAuth Login.*Xbox app/);
+  await assert.rejects(()=>xbox('/api/spoof/55'),/HTTP 403.*Xbox rejected the presence request/);
 });
 
 test('Xbox errors identify the failing operation without exposing response secrets', async () => {
@@ -51,6 +52,23 @@ test('manual XAuth sign-in resolves XUID independently from user hash', async ()
   const script="import {restoreXauth,loginStatus} from './xbox-client.js'; const fetcher=async url=>new Response(JSON.stringify(url.includes('profile.xboxlive.com')?{profileUsers:[{id:'1234'}]}:{People:[{Xuid:'1234'}]})); await restoreXauth({fetcher}); if(loginStatus().status!=='signed_in')process.exit(1);";
   await promisify(execFile)(process.execPath,['--input-type=module','-e',script],{cwd:process.cwd(),env:process.env});
   await signOut();assert.equal(loginStatus().status,'signed_out');await assert.rejects(()=>readFile(process.env.AUTH_FILE),{code:'ENOENT'});
+});
+
+test('Xbox PC sign-in checks candidates and preserves account on mismatch', async () => {
+  const first='XBL3.0 x=wrong;fake-token-12345678901234567890', second='XBL3.0 x=correct;fake-token-12345678901234567890';
+  const fetcher=async(url,options)=>new Response(JSON.stringify(url.includes('profile.xboxlive.com')?{profileUsers:[{id:'1234'}]}:{People:[{Xuid:options.headers.Authorization.includes('wrong')?'9999':'1234'}]}));
+  await attachXboxPc({expectedXuid:'1234',readCandidates:async()=>[first,second],fetcher});
+  assert.equal(loginStatus().source,'xbox-pc');
+  await assert.rejects(()=>attachXboxPc({expectedXuid:'1234',readCandidates:async()=>[first],fetcher}),/No usable Xbox PC authorization/);
+  assert.equal(loginStatus().status,'signed_in');assert.equal(loginStatus().source,'xbox-pc');
+  await signOut();
+});
+
+test('Xbox PC credential scanner validates output without exposing credentials', async () => {
+  await assert.rejects(()=>readXboxPcCandidates({platform:'darwin'}),/only on Windows/);
+  const values=await readXboxPcCandidates({platform:'win32',run:async()=>({stdout:JSON.stringify(['test-token'])})});
+  assert.deepEqual(values,['test-token']);
+  await assert.rejects(()=>readXboxPcCandidates({platform:'win32',run:async()=>{throw Error('private-token')}}),e=>!e.message.includes('private-token'));
 });
 
 test('profile, game lookup, achievements, and gamertag use XAU Xbox routes', async () => {
