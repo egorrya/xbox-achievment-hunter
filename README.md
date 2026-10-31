@@ -2,6 +2,8 @@
 
 A Windows companion app for Xbox achievement hunting, with automatic unlocking, customizable queues, playtime spoofing, and game stats.
 
+![Xbox Achievement Hunter game library](public/xbox-achievement-render.png)
+
 ## Download
 
 Download the portable Windows `.exe` from [GitHub Releases](https://github.com/egorrya/xbox-achievment-hunter/releases/latest). Open the Xbox PC app and sign in, then run the downloaded file. No installation or Node.js is required.
