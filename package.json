@@ -1,6 +1,6 @@
 {
   "name": "xbox-achievment-hunter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "main": "desktop.js",
@@ -19,7 +19,25 @@
     "appId": "com.xboxachievmenthunter.desktop",
     "productName": "Xbox Achievment Hunter",
     "asar": false,
-    "files": ["desktop.js", "server.js", "stats.js", "xbox-client.js", "windows-auth.js", "public/**/*", "windows/**/*", "build/icon.png", "package.json"],
-    "win": { "icon": "build/icon.ico", "target": ["portable"], "artifactName": "Xbox-Achievment-Hunter-${version}-Windows.${ext}" }
+    "files": [
+      "desktop.js",
+      "auth-state.js",
+      "connection-flight.js",
+      "server.js",
+      "stats.js",
+      "xbox-client.js",
+      "windows-auth.js",
+      "public/**/*",
+      "windows/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Xbox-Achievment-Hunter-${version}-Windows.${ext}"
+    }
   }
 }

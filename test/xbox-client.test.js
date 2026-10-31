@@ -104,3 +104,32 @@ test('Xbox rate limits preserve retry timing without exposing the response body'
   const xbox=createXboxApi({getToken:async()=>({userXUID:'1234',userHash:'hash',XSTSToken:'secret'}),fetcher:async()=>new Response('private',{status:429,headers:{'Retry-After':'45'}})});
   await assert.rejects(()=>xbox('/api/achievements/55'),e=>e.status===429 && e.retryAfter===45 && !e.message.includes('private'));
 });
+
+test('waits for Xbox authorization to become available',async()=>{
+  const {waitForXboxPcAuthorization}=await import('../windows-auth.js');
+  let attempts=0, time=0;
+  const result=await waitForXboxPcAuthorization(async()=>{if(++attempts<3)throw new Error('No Xbox PC authorization found.');return 'connected';},{timeout:10000,interval:1000,now:()=>time,sleep:async ms=>{time+=ms;}});
+  assert.equal(result,'connected');assert.equal(attempts,3);
+  await assert.rejects(()=>waitForXboxPcAuthorization(async()=>{throw new Error('reader failed');},{sleep:async()=>{throw new Error('unexpected retry');}}),/reader failed/);
+});
+
+
+test('Xbox connection cancels a stalled authorization scan at its deadline',async()=>{
+  const {waitForXboxPcAuthorization}=await import('../windows-auth.js');let aborted=false;
+  await assert.rejects(()=>waitForXboxPcAuthorization(({signal})=>new Promise((resolve,reject)=>signal.addEventListener('abort',()=>{aborted=true;reject(signal.reason);},{once:true})),{timeout:30}),/timed out/);
+  assert.equal(aborted,true);
+});
+test('an aborted Xbox scan cannot replace the active account',async()=>{
+  const controller=new AbortController();controller.abort(new Error('cancelled'));
+  await assert.rejects(()=>attachXboxPc({signal:controller.signal,readCandidates:async()=>{throw Error('should not scan');}}),/cancelled/);
+});
+
+
+test('timed-out token verification cannot sign in later',async()=>{
+  await signOut();
+  const {waitForXboxPcAuthorization}=await import('../windows-auth.js');
+  const token='XBL3.0 x=hash;'+ 'A'.repeat(40);
+  const fetcher=async url=>{await new Promise(resolve=>setTimeout(resolve,40));return Response.json(url.includes('profile.xboxlive.com')?{profileUsers:[{id:'1234'}]}:{People:[{Xuid:'1234'}]});};
+  await assert.rejects(()=>waitForXboxPcAuthorization(({signal})=>attachXboxPc({signal,readCandidates:async()=>[token],fetcher}),{timeout:10}),/timed out/);
+  await new Promise(resolve=>setTimeout(resolve,120));assert.equal(loginStatus().status,'signed_out');
+});

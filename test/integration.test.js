@@ -2,11 +2,88 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createInterface } from 'node:readline';
+
+test('Steam endpoints fetch only Steam paths and follow same-origin redirects', async () => {
+  const paths=[];
+  const mock=http.createServer((req,res)=>{paths.push(req.url);
+    if(req.url==='/id/player/?xml=1'){res.setHeader('Content-Type','application/xml');return res.end('<profile><privacyState>public</privacyState></profile>');}
+    if(req.url.startsWith('/api/storesearch/')){res.setHeader('Content-Type','application/json');return res.end(JSON.stringify({items:[{type:'app',id:620,name:'Portal 2'},{type:'bundle',id:3,name:'Bundle'}]}));}
+    if(req.url.startsWith('/profiles/76561197968575517/stats/620/achievements/')){res.statusCode=302;res.setHeader('Location','/id/player/achievements/620');return res.end();}
+    if(req.url==='/id/player/achievements/620')return res.end('<html>Steam page</html>');
+    res.statusCode=404;res.end();
+  });
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${mock.address().port}`,dir=await mkdtemp(join(tmpdir(),'steam-api-test-'));
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',STEAM_COMMUNITY_ORIGIN:origin,STEAM_STORE_ORIGIN:origin,STATE_FILE:join(dir,'state.json'),AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timeout);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timeout);reject(Error('server exited'));});});
+    let r=await fetch(base+'/api/steam/profile?'+new URLSearchParams({url:'https://steamcommunity.com/id/player/'}));assert.equal(r.status,200);assert.match((await r.json()).xml,/privacyState/);
+    r=await fetch(base+'/api/steam/profile?'+new URLSearchParams({url:'https://evil.test/id/player/'}));assert.equal(r.status,400);
+    r=await fetch(base+'/api/steam/search?'+new URLSearchParams({q:'Portal 2'}));assert.deepEqual((await r.json()).items,[{id:'620',name:'Portal 2'}]);
+    r=await fetch(base+'/api/steam/history?'+new URLSearchParams({steamId:'76561197968575517',appId:'620'}));assert.equal((await r.json()).content,'<html>Steam page</html>');assert.ok(paths.includes('/id/player/achievements/620'));
+    assert.equal((await fetch(base+'/api/steam/history?steamId=123&appId=620')).status,400);
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
+});
+
+test('stopping or losing spoof pauses the queue until the same spoof restarts', async () => {
+  let spoofRequests=0, failHeartbeat=false, unlocks=0;
+  const mock=http.createServer((req,res)=>{
+    res.setHeader('Content-Type','application/json');
+    if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url.startsWith('/api/spoof/')){spoofRequests++;if(failHeartbeat){res.statusCode=500;return res.end('{}');}return res.end(JSON.stringify({message:'Spoofing started successfully.',titleId:req.url.split('/').pop()}));}
+    if(req.url==='/api/achievements/unlock')unlocks++;
+    res.statusCode=404;res.end('{}');
+  });
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+  const dir=await mkdtemp(join(tmpdir(),'xau-spoof-queue-')),origin=`http://127.0.0.1:${mock.address().port}`,offsetFile=join(dir,'offset'),preload=join(dir,'clock.mjs');
+  await writeFile(offsetFile,'0');await writeFile(preload,`import {readFileSync} from 'node:fs'; const now=Date.now; Date.now=()=>now()+Number(readFileSync(${JSON.stringify(offsetFile)},'utf8'));`);
+  const child=spawn(process.execPath,['--import',preload,'server.js'],{env:{...process.env,PORT:'0',XAU_URL:origin,TITLE_CATALOG_URL:origin+'/catalog',STATE_FILE:join(dir,'state.json'),AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timeout);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timeout);reject(Error('server exited'));});});
+    const post=(path,data={})=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(data)});
+    assert.equal((await post('/api/spoofer/start',{titleId:'123'})).status,200);
+    assert.equal((await post('/api/start',{titleId:'123',entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z',delayMs:600000}]})).status,200);
+    assert.equal((await post('/api/spoofer/stop')).status,200);
+    let state=await (await fetch(base+'/api/state')).json();assert.equal(state.status,'paused');assert.ok(state.remaining>590000);assert.match(state.error,/Spoof stopped/);
+    assert.equal((await post('/api/resume')).status,400);
+    assert.equal((await post('/api/spoofer/start',{titleId:'456'})).status,200);assert.equal((await post('/api/resume')).status,400);
+    assert.equal((await post('/api/spoofer/stop')).status,200);assert.equal((await post('/api/spoofer/start',{titleId:'123'})).status,200);
+    assert.equal((await post('/api/resume')).status,200);
+    failHeartbeat=true;await writeFile(offsetFile,'300000');
+    for(let i=0;i<50;i++){state=await (await fetch(base+'/api/state')).json();if(state.status==='paused')break;await sleep(50);}
+    assert.equal(state.status,'paused');assert.match(state.error,/Spoof stopped/);assert.equal((await (await fetch(base+'/api/spoofer')).json()).status,'error');assert.equal((await post('/api/resume')).status,400);assert.equal(unlocks,0);assert.ok(spoofRequests>=4);
+    assert.equal(JSON.parse(await readFile(join(dir,'state.json'),'utf8')).status,'paused');
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
+});
+
+test('individual unlock targets one achievement and respects queue and request spacing', async () => {
+  const sent=[]; const owned=new Set();
+  const mock=http.createServer(async(req,res)=>{
+    res.setHeader('Content-Type','application/json');
+    if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url==='/api/achievements/123')return res.end(JSON.stringify({achievements:['1','2'].map(id=>({id,progressState:owned.has(id)?'Achieved':'NotStarted'}))}));
+    if(req.url==='/api/achievements/unlock'){let raw='';for await(const chunk of req)raw+=chunk;const body=JSON.parse(raw);sent.push(body);owned.add(body.achievementId);return res.end(JSON.stringify({message:'Achievement unlocked successfully',...body}));}
+    res.statusCode=404;res.end('{}');
+  });
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+  const dir=await mkdtemp(join(tmpdir(),'xau-single-test-')),origin=`http://127.0.0.1:${mock.address().port}`;
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_URL:origin,TITLE_CATALOG_URL:origin+'/catalog',STATE_FILE:join(dir,'state.json'),AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timeout);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timeout);reject(Error('server exited'));});});
+    const post=(path,data)=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(data)});
+    let response=await post('/api/achievement/unlock',{titleId:'123',achievementId:'1'});assert.equal(response.status,200);assert.equal((await response.json()).status,'confirmed');assert.deepEqual(sent,[{titleId:'123',achievementId:'1'}]);
+    response=await post('/api/achievement/unlock',{titleId:'123',achievementId:'1'});assert.equal((await response.json()).status,'already');assert.equal(sent.length,1);
+    response=await post('/api/achievement/unlock',{titleId:'123',achievementId:'2'});assert.equal(response.status,400);assert.match((await response.json()).error,/Wait a moment/);assert.equal(sent.length,1);
+    response=await post('/api/start',{titleId:'123',entries:[{id:'2',name:'Second',time:'2025-01-01T00:00:00Z',delayMs:600000}]});assert.equal(response.status,200);
+    response=await post('/api/achievement/unlock',{titleId:'123',achievementId:'2'});assert.equal(response.status,400);assert.match((await response.json()).error,/copy queue/);assert.equal(sent.length,1);
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
+});
 
 test('server reports its assigned port for the desktop window', async () => {
   const dir=await mkdtemp(join(tmpdir(),'xau-desktop-test-'));
@@ -125,17 +202,18 @@ test('restart after an interrupted unlock pauses without a stale remaining delay
   const probe=http.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));
   const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:String(port),AUTH_FILE:join(dir,'auth.json'),STATE_FILE:file},stdio:'ignore'});
   try {
-    let state;for(let i=0;i<40;i++){try{state=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();break}catch{await sleep(50)}}
+    let visible;for(let i=0;i<40;i++){try{visible=await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();break}catch{await sleep(50)}}
+    assert.deepEqual(visible,{status:'idle'});const state=JSON.parse(await readFile(file,'utf8'));
     assert.equal(state.status,'paused');assert.equal(state.index,0);assert.equal(state.remaining,0);assert.equal(state.uncertainId,'1');assert.match(state.error,/unknown/);
     assert.equal(JSON.parse(await readFile(file,'utf8')).status,'paused');
   } finally {child.kill();await new Promise(r=>child.once('exit',r));await rm(dir,{recursive:true,force:true});}
 });
 
 test('standalone spoof starts and stops independently of the queue', async () => {
-  const calls=[];
+  const calls=[];let account='9999';
   const mock=http.createServer((req,res)=>{
     calls.push(req.url);res.setHeader('Content-Type','application/json');
-    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:account}]}));
     if(req.url==='/api/spoof/123')return res.end(JSON.stringify({message:'Spoofing started successfully.',titleId:'123'}));
     res.statusCode=404;res.end('{}');
   });
@@ -151,6 +229,8 @@ test('standalone spoof starts and stops independently of the queue', async () =>
     assert.equal(JSON.parse(await readFile(join(dir,'state.json.spoof'),'utf8')).titleId,'123');
     assert.equal((await (await fetch(base+'/api/state')).json()).status,'idle');
     assert.equal((await send('/api/spoofer/start',{titleId:'123'})).status,400);
+    account='8888';assert.deepEqual(await (await fetch(base+'/api/spoofer')).json(),{status:'idle'});assert.equal((await send('/api/spoofer/stop')).status,400);
+    account='9999';assert.equal((await (await fetch(base+'/api/spoofer')).json()).status,'running');
     const stopped=await (await send('/api/spoofer/stop')).json();assert.equal(stopped.status,'idle');assert.match(stopped.notice,/expires/);assert.ok(stopped.endedAt);assert.equal(JSON.parse(await readFile(join(dir,'state.json.spoof'),'utf8')).status,'idle');
     await sleep(1200);assert.equal(calls.filter(x=>x==='/api/spoof/123').length,1);
   } finally {child.kill();await new Promise(r=>child.once('exit',r));await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
@@ -215,8 +295,145 @@ test('game playtime and settings persist independently of the server port', asyn
     assert.equal((await fetch(base+'/spoof-panel.js')).status,200);
     const options={method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({key:'xau-game-filters',value:'{"hideEmpty":true}'})};
     assert.equal((await fetch(base+'/api/settings',options)).status,200);
+    const steamSetting={...options,body:JSON.stringify({key:'steam-profile:9999',value:'{"url":"https://steamcommunity.com/id/player/"}'})};
+    assert.equal((await fetch(base+'/api/settings',steamSetting)).status,200);
     assert.equal((await fetch(base+'/api/auth/token',{...options,body:'{}'})).status,404);
     child.kill();await new Promise(r=>child.once('exit',r));instance=null;
-    instance=await launch();assert.equal((await (await fetch(instance.base+'/api/settings')).json())['xau-game-filters'],'{"hideEmpty":true}');
+    instance=await launch();const saved=await (await fetch(instance.base+'/api/settings')).json();assert.equal(saved['xau-game-filters'],'{"hideEmpty":true}');assert.match(saved['steam-profile:9999'],/steamcommunity/);
   } finally {if(instance){instance.child.kill();await new Promise(r=>instance.child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
+});
+
+test('desktop backend stays alive when its page closes', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'xau-desktop-lifetime-'));
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_DESKTOP:'1',XAU_URL:'http://127.0.0.1:1',AUTH_FILE:join(dir,'auth.json'),STATE_FILE:join(dir,'state.json')},stdio:['ignore','pipe','ignore']});
+  let exited=false;child.on('exit',()=>{exited=true});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(new Error('server exited'));});});
+    for(const path of ['heartbeat','close']){const response=await fetch(base+'/api/client/'+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({id:'desktop-client-123'})});assert.equal(response.status,200);}
+    await sleep(22000);
+    assert.equal(exited,false);
+    assert.equal((await fetch(base+'/api/state')).status,200);
+  } finally {if(!exited){child.kill();await new Promise(r=>child.once('exit',r));}await rm(dir,{recursive:true,force:true});}
+});
+
+test('desktop shutdown pauses the queue, stops the session and restart keeps them stopped', async () => {
+  const mock=http.createServer((req,res)=>{res.setHeader('Content-Type','application/json');if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));if(req.url==='/api/spoof/123')return res.end(JSON.stringify({message:'Spoofing started successfully.',titleId:'123'}));res.statusCode=404;res.end('{}');});
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+  const dir=await mkdtemp(join(tmpdir(),'xau-desktop-stop-')),file=join(dir,'state.json');
+  const env={...process.env,PORT:'0',XAU_DESKTOP:'1',XAU_URL:`http://127.0.0.1:${mock.address().port}`,TITLE_CATALOG_URL:`http://127.0.0.1:${mock.address().port}/catalog`,AUTH_FILE:join(dir,'auth.json'),STATE_FILE:file};
+  let child;
+  async function start(){child=spawn(process.execPath,['server.js'],{env,stdio:['ignore','pipe','ignore','ipc']});return await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(Error('server exited'));});});}
+  try {
+    let base=await start();
+    async function post(path,body){const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(body)});assert.equal(r.status,200);return r.json();}
+    await post('/api/start',{titleId:'123',entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z',delayMs:60000}]});
+    await post('/api/spoofer/start',{titleId:'123'});
+    const stopped=new Promise(resolve=>child.once('exit',resolve));child.send('shutdown');assert.equal(await stopped,0);
+    assert.equal(JSON.parse(await readFile(file,'utf8')).status,'paused');assert.equal(JSON.parse(await readFile(file+'.spoof','utf8')).status,'idle');
+    base=await start();assert.equal((await (await fetch(base+'/api/state')).json()).status,'paused');assert.equal((await (await fetch(base+'/api/spoofer')).json()).status,'idle');
+    await post('/api/spoofer/start',{titleId:'123'});await post('/api/resume',{});
+    const disconnected=new Promise(resolve=>child.once('exit',resolve));child.disconnect();assert.equal(await disconnected,0);
+    assert.equal(JSON.parse(await readFile(file,'utf8')).status,'paused');assert.equal(JSON.parse(await readFile(file+'.spoof','utf8')).status,'idle');
+  } finally {if(child && child.exitCode===null && child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
+});
+
+test('first desktop launch creates a missing data directory', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'xau-first-launch-'));
+  const file=join(dir,'new-user','state.json');
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_DESKTOP:'1',XAU_URL:'http://127.0.0.1:1',AUTH_FILE:join(dir,'new-user','auth','xauth.json'),STATE_FILE:file},stdio:['ignore','pipe','pipe','ipc']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(Error('server exited during first launch'));});});
+    assert.equal((await (await fetch(base+'/api/state')).json()).status,'idle');
+    assert.equal(JSON.parse(await readFile(file,'utf8')).status,'idle');
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await rm(dir,{recursive:true,force:true});}
+});
+
+
+test('corrupt saved files are preserved and do not prevent startup', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'xau-corrupt-')),file=join(dir,'state.json');
+  const corrupt={'state.json':'{broken queue','state.json.spoof':'{broken spoof','state.json.settings':'{broken settings'};
+  for(const [name,content] of Object.entries(corrupt))await writeFile(join(dir,name),content);
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_DESKTOP:'1',XAU_URL:'http://127.0.0.1:1',STATE_FILE:file,AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','pipe','ipc']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(Error('server exited'));});});
+    assert.equal((await (await fetch(base+'/api/state')).json()).status,'idle');
+    const warnings=(await (await fetch(base+'/api/startup-warnings')).json()).warnings;assert.equal(warnings.length,3);
+    const files=await readdir(dir);for(const [name,content] of Object.entries(corrupt)){const backup=files.find(item=>item.startsWith(name+'.invalid-'));assert.ok(backup);assert.equal(await readFile(join(dir,backup),'utf8'),content);}
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await rm(dir,{recursive:true,force:true});}
+});
+
+test('a planned one-hour gap is scheduled as one hour, not two seconds', async () => {
+  const calls=[];const mock=http.createServer(async(req,res)=>{calls.push(req.url);res.setHeader('Content-Type','application/json');
+    if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url==='/api/achievements/123')return res.end(JSON.stringify({achievements:[{id:'1',progressState:'NotStarted'},{id:'2',progressState:'NotStarted'},{id:'3',progressState:'NotStarted'}]}));
+    if(req.url==='/api/achievements/unlock'){let body='';for await(const chunk of req)body+=chunk;const item=JSON.parse(body);return res.end(JSON.stringify({message:'Achievement unlocked successfully',titleId:item.titleId,achievementId:item.achievementId}));}
+    res.statusCode=404;res.end('{}');
+  });
+  await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
+  const dir=await mkdtemp(join(tmpdir(),'xau-interval-'));const origin=`http://127.0.0.1:${mock.address().port}`;
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_URL:origin,TITLE_CATALOG_URL:origin+'/catalog',STATE_FILE:join(dir,'state.json'),AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(Error('server exited'));});});
+    const {planSelected}=await import('../public/timing.js');
+    const entries=planSelected([{id:'1',name:'First',time:'2024-01-01T00:00:00Z',selected:true},{id:'2',name:'Second',time:'2024-01-01T01:00:00Z',selected:true},{id:'3',name:'Third',time:'2024-12-31T01:00:00Z',selected:true}],10);
+    assert.equal(entries[1].delayMs,3600000);
+    const start=await fetch(base+'/api/start',{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({titleId:'123',entries})});assert.equal(start.status,200);
+    let state;for(let i=0;i<60;i++){state=await (await fetch(base+'/api/state')).json();if(state.index===1)break;await sleep(50);}
+    assert.equal(state.index,1);assert.ok(state.dueAt-state.lastUnlockAt>=3600000);assert.ok(state.dueAt-state.lastUnlockAt<3605000);
+    await sleep(2200);state=await (await fetch(base+'/api/state')).json();assert.equal(state.index,1);assert.equal(calls.filter(path=>path==='/api/achievements/unlock').length,1);
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(resolve=>child.once('exit',resolve));}await new Promise(resolve=>mock.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+test('the first planned achievement waits instead of unlocking immediately',async()=>{
+  const calls=[];const mock=http.createServer((req,res)=>{calls.push(req.url);res.setHeader('Content-Type','application/json');
+    if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    res.statusCode=404;res.end('{}');
+  });await new Promise(resolve=>mock.listen(0,'127.0.0.1',resolve));
+  const dir=await mkdtemp(join(tmpdir(),'xau-first-delay-')),origin=`http://127.0.0.1:${mock.address().port}`;
+  const child=spawn(process.execPath,['server.js'],{env:{...process.env,PORT:'0',XAU_URL:origin,TITLE_CATALOG_URL:origin+'/catalog',STATE_FILE:join(dir,'state.json'),AUTH_FILE:join(dir,'auth.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timer);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timer);reject(Error('server exited'));});});
+    const {planSelected}=await import('../public/timing.js');const firstDelayMs=55*60000;
+    const entries=planSelected([{id:'1',name:'First',time:'2024-01-01T00:00:00Z',selected:true}],2,{firstDelayMs});
+    const before=Date.now(),start=await fetch(base+'/api/start',{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify({titleId:'123',entries})});assert.equal(start.status,200);
+    const state=await start.json();assert.ok(state.dueAt>=before+firstDelayMs);await sleep(2200);
+    assert.equal((await (await fetch(base+'/api/state')).json()).index,0);assert.ok(!calls.includes('/api/achievements/unlock'));
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(resolve=>child.once('exit',resolve));}await new Promise(resolve=>mock.close(resolve));await rm(dir,{recursive:true,force:true});}
+});
+
+test('HTTP 503 reconnects spoof and resumes only the queue paused by that failure', async () => {
+  let unavailable=false, requests=0;
+  const mock=http.createServer((req,res)=>{
+    res.setHeader('Content-Type','application/json');
+    if(req.url==='/catalog')return res.end(JSON.stringify([{titleId:'123',isTitleBased:true}]));
+    if(req.url==='/api/profile/me')return res.end(JSON.stringify({People:[{Xuid:'9999'}]}));
+    if(req.url==='/api/spoof/123') { requests++; if(unavailable){res.statusCode=503;return res.end('{"error":"Service unavailable"}');} return res.end('{"message":"Spoofing started successfully.","titleId":"123"}'); }
+    res.statusCode=404;res.end('{}');
+  });
+  await new Promise(r=>mock.listen(0,'127.0.0.1',r));
+  const dir=await mkdtemp(join(tmpdir(),'xau-spoof-recovery-')),origin=`http://127.0.0.1:${mock.address().port}`,offsetFile=join(dir,'offset'),preload=join(dir,'clock.mjs');
+  await writeFile(offsetFile,'0');await writeFile(preload,`import {readFileSync} from 'node:fs'; const now=Date.now; Date.now=()=>now()+Number(readFileSync(${JSON.stringify(offsetFile)},'utf8'));`);
+  const child=spawn(process.execPath,['--import',preload,'server.js'],{env:{...process.env,PORT:'0',XAU_URL:origin,TITLE_CATALOG_URL:origin+'/catalog',STATE_FILE:join(dir,'state.json')},stdio:['ignore','pipe','ignore']});
+  try {
+    const base=await new Promise((resolve,reject)=>{const timeout=setTimeout(()=>reject(Error('server did not start')),5000);createInterface({input:child.stdout}).on('line',line=>{const match=line.match(/^XAU Companion: (http:\/\/127\.0\.0\.1:\d+) /);if(match){clearTimeout(timeout);resolve(match[1]);}});child.once('exit',()=>{clearTimeout(timeout);reject(Error('server exited'));});});
+    const post=(path,data={})=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',Origin:base},body:JSON.stringify(data)});
+    const read=async path=>(await fetch(base+path)).json();
+    const waitFor=async (path,predicate)=>{for(let i=0;i<100;i++){const result=await read(path);if(predicate(result))return result;await sleep(50);}throw Error('Timed out waiting for '+path);};
+    assert.equal((await post('/api/spoofer/start',{titleId:'123'})).status,200);
+    assert.equal((await post('/api/start',{titleId:'123',entries:[{id:'1',name:'First',time:'2025-01-01T00:00:00Z',delayMs:600000}]})).status,200);
+    unavailable=true;await writeFile(offsetFile,'300000');
+    await waitFor('/api/spoofer',s=>s.status==='recovering');
+    const paused=await read('/api/state');assert.equal(paused.status,'paused');assert.ok(paused.remaining>290000);
+    assert.equal((await post('/api/resume')).status,400);
+    await writeFile(offsetFile,'331000');await waitFor('/api/spoofer',()=>requests>=3);
+    assert.equal((await read('/api/state')).status,'paused');
+    unavailable=false;await writeFile(offsetFile,'362000');await waitFor('/api/spoofer',s=>s.status==='running');
+    const resumed=await read('/api/state');assert.equal(resumed.status,'running');assert.ok(resumed.dueAt-Date.now()-362000>280000);
+    assert.equal((await post('/api/pause')).status,200);
+    unavailable=true;await writeFile(offsetFile,'653000');await waitFor('/api/spoofer',s=>s.status==='recovering');
+    unavailable=false;await writeFile(offsetFile,'684000');await waitFor('/api/spoofer',s=>s.status==='running');
+    assert.equal((await read('/api/state')).status,'paused');
+  } finally {if(child.exitCode===null&&child.signalCode===null){child.kill();await new Promise(r=>child.once('exit',r));}await new Promise(r=>mock.close(r));await rm(dir,{recursive:true,force:true});}
 });

@@ -110,7 +110,7 @@ return async function xboxApi(path,options={}){
 }
 export const xboxApi = createXboxApi();
 
-export async function useXauth(value,{fetcher=fetch,persist=true,expectedXuid,source='manual'}={}){
+export async function useXauth(value,{fetcher=fetch,persist=true,expectedXuid,source='manual',signal}={}){
   if (manualPending) throw new Error('Token verification is already in progress');
   if (typeof value !== 'string' || value.length > 16384) throw new Error('Invalid XAuth token format');
   const match=value.trim().match(/^XBL3\.0 x=([^\s;]{1,128});([^\s;]{20,})$/);
@@ -124,17 +124,22 @@ export async function useXauth(value,{fetcher=fetch,persist=true,expectedXuid,so
     const xuid=profile?.People?.[0]?.Xuid ?? profile?.people?.[0]?.xuid;
     if(typeof xuid!=='string'||!/^\d+$/.test(xuid))throw new Error('Xbox did not return the signed-in profile');
     if(expectedXuid && xuid!==expectedXuid)throw new Error('The Xbox PC account does not match the active account');
+    signal?.throwIfAborted();
     if(persist)await saveToken(value.trim());
     else if(source==='xbox-pc') { try { await unlink(authFile); } catch(e) { if(e.code!=='ENOENT')throw new Error('Could not remove the previous saved token'); } }
+    signal?.throwIfAborted();
     candidate.userXUID=xuid; session=candidate;restoreError=undefined;
   } finally {manualPending=false;}
 }
 
-export async function attachXboxPc({expectedXuid,readCandidates=readXboxPcCandidates,fetcher=fetch}={}) {
-  const candidates=await readCandidates();
+export async function attachXboxPc({expectedXuid,readCandidates=readXboxPcCandidates,fetcher=fetch,signal}={}) {
+  signal?.throwIfAborted();
+  const candidates=await readCandidates({signal});
+  const boundedFetch=signal ? (url,options)=>fetcher(url,{...options,signal:AbortSignal.any([signal,options.signal])}) : fetcher;
   for(const value of candidates){
-    try { await useXauth(value,{fetcher,persist:false,expectedXuid,source:'xbox-pc'}); return loginStatus(); }
-    catch { /* A stale or unrelated credential must not prevent checking the next one. */ }
+    signal?.throwIfAborted();
+    try { await useXauth(value,{fetcher:boundedFetch,persist:false,expectedXuid,source:'xbox-pc',signal}); return loginStatus(); }
+    catch { signal?.throwIfAborted(); /* Check the next stale or unrelated credential. */ }
   }
   throw new Error('No usable Xbox PC authorization found for this account. Sign in to the Xbox app and try again.');
 }
